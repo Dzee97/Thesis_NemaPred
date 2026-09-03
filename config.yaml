@@ -1,0 +1,18 @@
+project:
+  version: 1.0
+  seed: 69
+  data_dir: data
+  output_dir: output
+  log_dir: output/logs
+
+download:
+  base_url: https://www.arb-silva.de/fileadmin/silva_databases/current/Exports/
+  file_name: SILVA_144_SSURef_tax_silva_full_align_trunc.fasta.gz
+  target_taxon: Nematoda
+  output_fasta: raw/silva_144_ssuref_nematoda_aligned.fasta.gz
+
+preprocess:
+  min_ungapped_length: 1200
+  max_ambiguity_fraction: 0.02
+  output_aligned_fasta: processed/sequences_aligned.fasta.gz
+  output_ungapped_fasta: processed/sequences_ungapped.fasta.gz
