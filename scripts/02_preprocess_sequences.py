@@ -20,17 +20,31 @@ from sqlmodel import Field, Session, SQLModel, create_engine, select
 class SequenceInfo(SQLModel, table=True):
     sequence_id: str = Field(primary_key=True)
     description: str
+
     aligned_zlib: bytes
     positions_bytes: bytes
     bases_bytes: bytes
+
     length: int
     ambiguity_fraction: float
     first_column: int
     last_column: int
 
+    duplicate_of: str | None = Field(
+        default=None,
+        foreign_key="sequenceinfo.sequence_id",
+        index=True,
+    )
+
+    contained_by: str | None = Field(
+        default=None,
+        foreign_key="sequenceinfo.sequence_id",
+        index=True,
+    )
+
     @property
     def positions(self) -> np.ndarray:
-        return np.frombuffer(self.positions_bytes, dtype=np.int32)
+        return np.frombuffer(self.positions_bytes, dtype=np.uint16)
 
     @property
     def bases(self) -> np.ndarray:
@@ -42,7 +56,7 @@ class SequenceInfo(SQLModel, table=True):
 
     @property
     def ungapped_sequence(self) -> str:
-        return self.bases.tobytes().decode("ascii")
+        return self.bases_bytes.decode("ascii")
 
 
 def sequence_normalization_mapping() -> dict[int, str]:
@@ -75,7 +89,7 @@ def ambiguity_fraction(bases: np.ndarray) -> float:
 
 def sparse_sequence(aligned_sequence: str) -> tuple[np.ndarray, np.ndarray]:
     encoded = np.frombuffer(aligned_sequence.encode("ascii"), dtype=np.uint8)
-    positions = np.flatnonzero(encoded != ord("-")).astype(np.int32)
+    positions = np.flatnonzero(encoded != ord("-")).astype(np.uint16)
     bases = encoded[positions].copy()
     return positions, bases
 
@@ -144,7 +158,7 @@ def main() -> None:
                     SequenceInfo(
                         sequence_id=record.id,
                         description=record.description,
-                        aligned_zlib=zlib.compress(normalized_seq.encode("ascii"), level=1),
+                        aligned_zlib=zlib.compress(normalized_seq.encode("ascii")),
                         positions_bytes=positions.tobytes(),
                         bases_bytes=bases.tobytes(),
                         length=len(positions),
