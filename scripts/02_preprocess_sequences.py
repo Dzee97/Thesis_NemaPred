@@ -1,108 +1,164 @@
-import hashlib
 import gzip
+import hashlib
+import heapq
+import io
+import tarfile
+import zlib
+import argparse
+from array import array
+from collections import defaultdict
+from dataclasses import dataclass, fields
 from pathlib import Path
+from typing import Any
+
+import numpy as np
 from Bio import SeqIO
-from Bio.Seq import Seq
-from Bio.SeqRecord import SeqRecord
+from tqdm import tqdm
+from sqlmodel import Field, Session, SQLModel, create_engine, select
 
-if "snakemake" not in globals():
-    from snakemake.script import Snakemake
-    snakemake: Snakemake = None
 
-DNA = set("ACGT")
-IUPAC_CHARS = "ACGTRYSWKMBDHVN"
-GAP_CHARS = "-.~_"
+class SequenceInfo(SQLModel, table=True):
+    sequence_id: str = Field(primary_key=True)
+    description: str
+    aligned_zlib: bytes
+    positions_bytes: bytes
+    bases_bytes: bytes
+    length: int
+    ambiguity_fraction: float
+    first_column: int
+    last_column: int
 
-trans_dict = {}
-# Standard DNA/IUPAC entries
-for c in IUPAC_CHARS:
-    trans_dict[ord(c)] = c
-    trans_dict[ord(c.lower())] = c
-# Fix RNA Uracil to Thymine
-trans_dict[ord('U')] = 'T'
-trans_dict[ord('u')] = 'T'
-# Normalize Gaps
-for c in GAP_CHARS:
-    trans_dict[ord(c)] = '-'
+    @property
+    def positions(self) -> np.ndarray:
+        return np.frombuffer(self.positions_bytes, dtype=np.int32)
 
-# Create the translation table with 'N' as the fallback for anything else
-NORMALIZE_TRANS = str.maketrans(trans_dict)
-NORMALIZE_TRANS.update({i: ord('N') for i in range(256) if i not in trans_dict})
+    @property
+    def bases(self) -> np.ndarray:
+        return np.frombuffer(self.bases_bytes, dtype=np.uint8)
 
-def ambiguity_fraction(sequence: str) -> float:
-    if not sequence:
+    @property
+    def aligned_sequence(self) -> str:
+        return zlib.decompress(self.aligned_zlib).decode("ascii")
+
+    @property
+    def ungapped_sequence(self) -> str:
+        return self.bases.tobytes().decode("ascii")
+
+
+def sequence_normalization_mapping() -> dict[int, str]:
+    IUPAC_CHARS = "ACGTRYSWKMBDHVN"
+    GAP_CHARS = "-.~_"
+
+    trans_dict = {}
+    for c in IUPAC_CHARS:
+        trans_dict[ord(c)] = c
+        trans_dict[ord(c.lower())] = c
+    trans_dict[ord("U")] = "T"
+    trans_dict[ord("u")] = "T"
+    for c in GAP_CHARS:
+        trans_dict[ord(c)] = "-"
+
+    trans_dict.update({i: ord("N") for i in range(256) if i not in trans_dict})
+
+    return trans_dict
+
+
+def ambiguity_fraction(bases: np.ndarray) -> float:
+    if len(bases) == 0:
         return 1.0
-    dna_count = sequence.count('A') + sequence.count('C') + sequence.count('G') + sequence.count('T')
-    return (len(sequence) - dna_count) / len(sequence)
+
+    is_unambiguous = (
+        (bases == ord("A")) | (bases == ord("C")) | (bases == ord("G")) | (bases == ord("T"))
+    )
+    return 1.0 - float(is_unambiguous.mean())
+
+
+def sparse_sequence(aligned_sequence: str) -> tuple[np.ndarray, np.ndarray]:
+    encoded = np.frombuffer(aligned_sequence.encode("ascii"), dtype=np.uint8)
+    positions = np.flatnonzero(encoded != ord("-")).astype(np.int32)
+    bases = encoded[positions].copy()
+    return positions, bases
+
+
+@dataclass
+class Config:
+    min_ungapped_length: int
+    max_ambiguity_fraction: float
+    input_fasta: Path
+    output_aligned_fasta: Path
+    output_ungapped_fasta: Path
+
 
 def main() -> None:
-    min_ungapped_length = snakemake.params.min_ungapped_length
-    max_ambiguity_fraction = snakemake.params.max_ambiguity_fraction
-    input_fasta = Path(snakemake.input.input_fasta)
-    output_aligned_fasta = Path(snakemake.output.output_aligned_fasta)
-    output_ungapped_fasta = Path(snakemake.output.output_ungapped_fasta)
+    snakemake = globals().get("snakemake", None)
 
-    scanned = kept = dropped_length = dropped_ambiguity = dropped_duplicate = 0
-    seen_hashes = set()
+    if snakemake is not None:
+        cfg = Config(**(dict(snakemake.input) | dict(snakemake.output) | dict(snakemake.params)))
+    else:
+        parser = argparse.ArgumentParser()
+        for field in fields(Config):
+            flag = f"--{field.name}"
+            kwargs = {"type": field.type, "required": True}
+            if field.type is bool:
+                kwargs = {"action": "store_true", "required": False}
 
-    try:
-        with gzip.open(input_fasta, "rt", encoding="utf-8") as in_gz, \
-             gzip.open(output_aligned_fasta, "wt", encoding="utf-8") as out_aligned_gz, \
-             gzip.open(output_ungapped_fasta, "wt", encoding="utf-8") as out_ungapped_gz:
+            parser.add_argument(flag, **kwargs)
 
-            for record in SeqIO.parse(in_gz, "fasta"):
-                scanned += 1
+        cfg = Config(**vars(parser.parse_args()))
 
-                normalized_seq = str(record.seq).translate(NORMALIZE_TRANS)
-                ungapped_seq = normalized_seq.replace("-", "")
+    num_sequences = 0
+    alignment_length = None
+    normalize_mapping = sequence_normalization_mapping()
 
-                if len(ungapped_seq) < min_ungapped_length:
-                    dropped_length += 1
-                    continue
+    sqlite_url = "sqlite:///sequences.db"
+    batch_size = 1000
+    engine = create_engine(sqlite_url)
+    SQLModel.metadata.create_all(engine)
 
-                if ambiguity_fraction(ungapped_seq) > max_ambiguity_fraction:
-                    dropped_ambiguity += 1
-                    continue
+    with tarfile.open(cfg.input_fasta, "r:gz") as tar:
+        member = tar.getmembers()[0]
+        tar_file = tar.extractfile(member)
+        if tar_file is None:
+            raise TypeError(f"Could not extract data from: {member.name}")
 
-                seq_hash = hashlib.sha256(ungapped_seq.encode("utf-8")).hexdigest()
-                if seq_hash in seen_hashes:
-                    dropped_duplicate += 1
-                    continue
-                seen_hashes.add(seq_hash)
+        with (
+            io.TextIOWrapper(tar_file, encoding="utf-8", errors="replace") as text_in,
+            Session(engine) as session,
+        ):
+            for record in tqdm(SeqIO.parse(text_in, "fasta"), desc="Loading sequences"):
+                num_sequences += 1
 
-                # Step 5: High-speed Raw Writes 
-                # Avoids object instantiation overhead of SeqRecord and Bio.SeqIO.write
-                header = f">{record.description}\n"
-                
-                out_aligned_gz.write(header)
-                out_aligned_gz.write(normalized_seq)
-                out_aligned_gz.write("\n")
-                
-                out_ungapped_gz.write(header)
-                out_ungapped_gz.write(ungapped_seq)
-                out_ungapped_gz.write("\n")
-                
-                kept += 1
-
-                if scanned % 5000 == 0:
-                    print(
-                        f"Processed {scanned:,} records | Kept: {kept:,} | "
-                        f"Dropped (Len: {dropped_length:,}, Amb: {dropped_ambiguity:,}, Dup: {dropped_duplicate:,})", 
-                        flush=True
+                if alignment_length is None:
+                    alignment_length = len(record.seq)
+                elif len(record.seq) != alignment_length:
+                    raise ValueError(
+                        f"Inconsistent alignment length for {record.id}: "
+                        f"{len(record.seq)} != {alignment_length}"
                     )
 
-        print("\n=== Filtering Summary ===")
-        print(f"Total Scanned:         {scanned:,}")
-        print(f"Dropped (Too Short):   {dropped_length:,}")
-        print(f"Dropped (Ambiguity):   {dropped_ambiguity:,}")
-        print(f"Dropped (Duplicates):  {dropped_duplicate:,}")
-        print(f"Total Retained:        {kept:,}")
-        print("=========================")
+                normalized_seq = str(record.seq).translate(normalize_mapping)
 
-    except Exception:
-        output_aligned_fasta.unlink(missing_ok=True)
-        output_ungapped_fasta.unlink(missing_ok=True)
-        raise
+                positions, bases = sparse_sequence(normalized_seq)
+
+                session.add(
+                    SequenceInfo(
+                        sequence_id=record.id,
+                        description=record.description,
+                        aligned_zlib=zlib.compress(normalized_seq.encode("ascii"), level=1),
+                        positions_bytes=positions.tobytes(),
+                        bases_bytes=bases.tobytes(),
+                        length=len(positions),
+                        ambiguity_fraction=ambiguity_fraction(bases),
+                        first_column=int(positions[0]),
+                        last_column=int(positions[-1]),
+                    )
+                )
+
+                if num_sequences % batch_size == 0:
+                    session.commit()
+
+            session.commit()
+
 
 if __name__ == "__main__":
     main()

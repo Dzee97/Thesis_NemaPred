@@ -1,0 +1,158 @@
+import hashlib
+import gzip
+import tarfile
+import io
+from pathlib import Path
+from collections import Counter
+from Bio import SeqIO
+import matplotlib.pyplot as plt
+
+if "snakemake" not in globals():
+    from snakemake.script import Snakemake
+    snakemake: Snakemake = None
+
+DNA = set("ACGT")
+IUPAC_CHARS = "ACGTRYSWKMBDHVN"
+GAP_CHARS = "-.~_"
+
+trans_dict = {}
+for c in IUPAC_CHARS:
+    trans_dict[ord(c)] = c
+    trans_dict[ord(c.lower())] = c
+trans_dict[ord('U')] = 'T'
+trans_dict[ord('u')] = 'T'
+for c in GAP_CHARS:
+    trans_dict[ord(c)] = '-'
+
+NORMALIZE_TRANS = str.maketrans(trans_dict)
+NORMALIZE_TRANS.update({i: ord('N') for i in range(256) if i not in trans_dict})
+
+def ambiguity_fraction(sequence: str) -> float:
+    if not sequence:
+        return 1.0
+    dna_count = sequence.count('A') + sequence.count('C') + sequence.count('G') + sequence.count('T')
+    return (len(sequence) - dna_count) / len(sequence)
+
+def main() -> None:
+    min_ungapped_length = snakemake.params.min_ungapped_length
+    max_ambiguity_fraction = snakemake.params.max_ambiguity_fraction
+    input_fasta = Path(snakemake.input.input_fasta)
+    output_aligned_fasta = Path(snakemake.output.output_aligned_fasta)
+    output_ungapped_fasta = Path(snakemake.output.output_ungapped_fasta)
+    
+    # Target file paths for the static PNG figures
+    output_length_plot = Path(snakemake.output.output_length_plot)
+    output_column_plot = Path(snakemake.output.output_column_plot)
+
+    scanned = kept = dropped_length = dropped_ambiguity = dropped_duplicate = 0
+    seen_hashes = set()
+
+    # Data collection setups
+    ungapped_lengths = []
+    column_occupancy = []
+    alignment_length = 0
+
+    try:
+        with tarfile.open(input_fasta, "r:gz") as tar, \
+             gzip.open(output_aligned_fasta, "wt", encoding="utf-8") as out_aligned_gz, \
+             gzip.open(output_ungapped_fasta, "wt", encoding="utf-8") as out_ungapped_gz:
+
+            members = tar.getmembers()
+            if not members:
+                raise FileNotFoundError("The provided .tgz archive is empty.")
+            
+            tar_file_obj = tar.extractfile(members[0])
+            if tar_file_obj is None:
+                raise TypeError(f"Could not extract data stream from: {members.name}")
+
+            with io.TextIOWrapper(tar_file_obj, encoding="utf-8", errors="replace") as in_text:
+                for record in SeqIO.parse(in_text, "fasta"):
+                    scanned += 1
+
+                    normalized_seq = str(record.seq).translate(NORMALIZE_TRANS)
+                    ungapped_seq = normalized_seq.replace("-", "")
+
+                    if len(ungapped_seq) < min_ungapped_length:
+                        dropped_length += 1
+                        continue
+
+                    if ambiguity_fraction(ungapped_seq) > max_ambiguity_fraction:
+                        dropped_ambiguity += 1
+                        continue
+
+                    seq_hash = hashlib.sha256(ungapped_seq.encode("utf-8")).hexdigest()
+                    if seq_hash in seen_hashes:
+                        dropped_duplicate += 1
+                        continue
+                    seen_hashes.add(seq_hash)
+
+                    header = f">{record.description}\n"
+                    
+                    out_aligned_gz.write(header)
+                    out_aligned_gz.write(normalized_seq)
+                    out_aligned_gz.write("\n")
+                    
+                    out_ungapped_gz.write(header)
+                    out_ungapped_gz.write(ungapped_seq)
+                    out_ungapped_gz.write("\n")
+                    
+                    kept += 1
+
+                    # 1. Store length for histogram calculation
+                    ungapped_lengths.append(len(ungapped_seq))
+
+                    # 2. Allocate and update positional profiles 
+                    if not column_occupancy:
+                        alignment_length = len(normalized_seq)
+                        column_occupancy = [0] * alignment_length
+                    
+                    for idx, char in enumerate(normalized_seq):
+                        if char != "-":
+                            column_occupancy[idx] += 1
+
+        print("\n=== Filtering Summary ===")
+        print(f"Total Scanned:         {scanned:,}")
+        print(f"Dropped (Too Short):   {dropped_length:,}")
+        print(f"Dropped (Ambiguity):   {dropped_ambiguity:,}")
+        print(f"Dropped (Duplicates):  {dropped_duplicate:,}")
+        print(f"Total Retained:        {kept:,}")
+        print("=========================")
+
+        # Ensure output directories exist for plots
+        output_length_plot.parent.mkdir(parents=True, exist_ok=True)
+        output_column_plot.parent.mkdir(parents=True, exist_ok=True)
+
+        # Plot 1: Kept Ungapped Sequences Length Profile
+        plt.figure(figsize=(10, 5))
+        plt.hist(ungapped_lengths, bins=50, color='#3b82f6', edgecolor='black', alpha=0.7)
+        plt.title('Distribution of Kept Sequence Lengths (Ungapped)', fontsize=14, fontweight='bold')
+        plt.xlabel('Sequence Length (bp)', fontsize=12)
+        plt.ylabel('Frequency', fontsize=12)
+        plt.grid(axis='y', linestyle='--', alpha=0.5)
+        plt.tight_layout()
+        plt.savefig(output_length_plot, dpi=300)
+        plt.close()
+
+        # Plot 2: Positional Alignment Occupancy
+        plt.figure(figsize=(12, 5))
+        plt.plot(range(1, alignment_length + 1), column_occupancy, color='#10b981', linewidth=1.5)
+        plt.fill_between(range(1, alignment_length + 1), column_occupancy, color='#10b981', alpha=0.3)
+        plt.title('Alignment Column Occupancy Profile', fontsize=14, fontweight='bold')
+        plt.xlabel('Alignment Position Coordinate', fontsize=12)
+        plt.ylabel('Number of Active Sequences', fontsize=12)
+        plt.grid(True, linestyle='--', alpha=0.5)
+        plt.tight_layout()
+        plt.savefig(output_column_plot, dpi=300)
+        plt.close()
+
+        print(f"Successfully generated figures:\n - {output_length_plot}\n - {output_column_plot}")
+
+    except Exception:
+        output_aligned_fasta.unlink(missing_ok=True)
+        output_ungapped_fasta.unlink(missing_ok=True)
+        output_length_plot.unlink(missing_ok=True)
+        output_column_plot.unlink(missing_ok=True)
+        raise
+
+if __name__ == "__main__":
+    main()

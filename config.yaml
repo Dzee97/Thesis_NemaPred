@@ -12,7 +12,9 @@ download:
   output_fasta: raw/silva_144_ssuref_nematoda_aligned.fasta.gz
 
 preprocess:
-  min_ungapped_length: 1200
+  min_ungapped_length: 300
   max_ambiguity_fraction: 0.02
   output_aligned_fasta: processed/sequences_aligned.fasta.gz
   output_ungapped_fasta: processed/sequences_ungapped.fasta.gz
+  output_length_plot: processed/output_length_plot.png
+  output_column_plot: processed/output_column_plot.png
