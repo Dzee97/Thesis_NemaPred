@@ -20,10 +20,6 @@ rule preprocess_sequences:
     input:
         input_fasta = DATA_DIR / "raw" / "arb-silva.de_2026-09-03_id1507588.tgz"
     output:
-        output_aligned_fasta = DATA_DIR / config["preprocess"]["output_aligned_fasta"],
-        output_ungapped_fasta = DATA_DIR / config["preprocess"]["output_ungapped_fasta"],
-    params:
-        min_ungapped_length = config["preprocess"]["min_ungapped_length"],
-        max_ambiguity_fraction = config["preprocess"]["max_ambiguity_fraction"]
+        output_database = DATA_DIR / config["preprocess"]["output_database"],
     script:
         "scripts/02_preprocess_sequences.py"

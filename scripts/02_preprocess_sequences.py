@@ -1,80 +1,30 @@
-import gzip
 import hashlib
-import heapq
 import io
 import tarfile
 import zlib
-import argparse
-from array import array
-from collections import defaultdict
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 from Bio import SeqIO
+from sqlmodel import Session, SQLModel, create_engine
+from src.common import parse_config
+from src.database import SequenceInfo
 from tqdm import tqdm
-from sqlmodel import Field, Session, SQLModel, create_engine, select
 
+IUPAC_CHARS = "ACGTRYSWKMBDHVN"
+GAP_CHARS = "-.~_"
 
-class SequenceInfo(SQLModel, table=True):
-    sequence_id: str = Field(primary_key=True)
-    description: str
+TRANS_DICT = {}
+for c in IUPAC_CHARS:
+    TRANS_DICT[ord(c)] = c
+    TRANS_DICT[ord(c.lower())] = c
+TRANS_DICT[ord("U")] = "T"
+TRANS_DICT[ord("u")] = "T"
+for c in GAP_CHARS:
+    TRANS_DICT[ord(c)] = "-"
 
-    aligned_zlib: bytes
-    positions_bytes: bytes
-    bases_bytes: bytes
-
-    length: int
-    ambiguity_fraction: float
-    first_column: int
-    last_column: int
-
-    duplicate_of: str | None = Field(
-        default=None,
-        foreign_key="sequenceinfo.sequence_id",
-        index=True,
-    )
-
-    contained_by: str | None = Field(
-        default=None,
-        foreign_key="sequenceinfo.sequence_id",
-        index=True,
-    )
-
-    @property
-    def positions(self) -> np.ndarray:
-        return np.frombuffer(self.positions_bytes, dtype=np.uint16)
-
-    @property
-    def bases(self) -> np.ndarray:
-        return np.frombuffer(self.bases_bytes, dtype=np.uint8)
-
-    @property
-    def aligned_sequence(self) -> str:
-        return zlib.decompress(self.aligned_zlib).decode("ascii")
-
-    @property
-    def ungapped_sequence(self) -> str:
-        return self.bases_bytes.decode("ascii")
-
-
-def sequence_normalization_mapping() -> dict[int, str]:
-    IUPAC_CHARS = "ACGTRYSWKMBDHVN"
-    GAP_CHARS = "-.~_"
-
-    trans_dict = {}
-    for c in IUPAC_CHARS:
-        trans_dict[ord(c)] = c
-        trans_dict[ord(c.lower())] = c
-    trans_dict[ord("U")] = "T"
-    trans_dict[ord("u")] = "T"
-    for c in GAP_CHARS:
-        trans_dict[ord(c)] = "-"
-
-    trans_dict.update({i: ord("N") for i in range(256) if i not in trans_dict})
-
-    return trans_dict
+TRANS_DICT.update({i: ord("N") for i in range(256) if i not in TRANS_DICT})
 
 
 def ambiguity_fraction(bases: np.ndarray) -> float:
@@ -96,35 +46,19 @@ def sparse_sequence(aligned_sequence: str) -> tuple[np.ndarray, np.ndarray]:
 
 @dataclass
 class Config:
-    min_ungapped_length: int
-    max_ambiguity_fraction: float
     input_fasta: Path
-    output_aligned_fasta: Path
-    output_ungapped_fasta: Path
+    output_database: Path
 
 
 def main() -> None:
     snakemake = globals().get("snakemake", None)
-
-    if snakemake is not None:
-        cfg = Config(**(dict(snakemake.input) | dict(snakemake.output) | dict(snakemake.params)))
-    else:
-        parser = argparse.ArgumentParser()
-        for field in fields(Config):
-            flag = f"--{field.name}"
-            kwargs = {"type": field.type, "required": True}
-            if field.type is bool:
-                kwargs = {"action": "store_true", "required": False}
-
-            parser.add_argument(flag, **kwargs)
-
-        cfg = Config(**vars(parser.parse_args()))
+    cfg = parse_config(Config, snakemake)
 
     num_sequences = 0
     alignment_length = None
-    normalize_mapping = sequence_normalization_mapping()
+    seen_hashes = {}
 
-    sqlite_url = "sqlite:///sequences.db"
+    sqlite_url = f"sqlite:///{cfg.output_database}"
     batch_size = 1000
     engine = create_engine(sqlite_url)
     SQLModel.metadata.create_all(engine)
@@ -150,14 +84,24 @@ def main() -> None:
                         f"{len(record.seq)} != {alignment_length}"
                     )
 
-                normalized_seq = str(record.seq).translate(normalize_mapping)
+                normalized_seq = str(record.seq).translate(TRANS_DICT)
 
                 positions, bases = sparse_sequence(normalized_seq)
+
+                seq_hash = hashlib.sha256(bases.tobytes()).hexdigest()
+                duplicate_of = seen_hashes.get(seq_hash)
+                if duplicate_of is None:
+                    seen_hashes[seq_hash] = record.id
+
+                tax_fields = record.description.removeprefix(record.id).strip().split(";")
 
                 session.add(
                     SequenceInfo(
                         sequence_id=record.id,
-                        description=record.description,
+                        tax_phylum=tax_fields[-4],
+                        tax_class=tax_fields[-3],
+                        tax_order=tax_fields[-2],
+                        tax_species=tax_fields[-1],
                         aligned_zlib=zlib.compress(normalized_seq.encode("ascii")),
                         positions_bytes=positions.tobytes(),
                         bases_bytes=bases.tobytes(),
@@ -165,6 +109,7 @@ def main() -> None:
                         ambiguity_fraction=ambiguity_fraction(bases),
                         first_column=int(positions[0]),
                         last_column=int(positions[-1]),
+                        duplicate_of=duplicate_of,
                     )
                 )
 
