@@ -1,5 +1,3 @@
-import zlib
-
 import numpy as np
 from sqlmodel import Field, SQLModel
 
@@ -12,7 +10,6 @@ class SequenceInfo(SQLModel, table=True):
     tax_order: str
     tax_species: str
 
-    aligned_zlib: bytes
     positions_bytes: bytes
     bases_bytes: bytes
 
@@ -40,10 +37,6 @@ class SequenceInfo(SQLModel, table=True):
     @property
     def bases(self) -> np.ndarray:
         return np.frombuffer(self.bases_bytes, dtype=np.uint8)
-
-    @property
-    def aligned_sequence(self) -> str:
-        return zlib.decompress(self.aligned_zlib).decode("ascii")
 
     @property
     def ungapped_sequence(self) -> str:
