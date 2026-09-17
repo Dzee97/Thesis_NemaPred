@@ -1,7 +1,9 @@
+import tarfile
 from collections import defaultdict
 from pathlib import Path
 from urllib.parse import quote
 
+import numpy as np
 import pandas as pd
 import requests
 from Bio import SeqIO
@@ -12,10 +14,17 @@ INPUT_FASTA = Path(
     "data/raw/Project_data_Nematode_traits/18S_references/MarNemaFunDiv_18S_sequences_combined.fasta"
 )
 INPUT_GENERA = Path("data/raw/Project_data_Nematode_traits/MarNemaFunDiv_Genera.xlsx")
+SILVA_TGZ = Path("data/raw/arb-silva.de_2026-09-03_id1507588.tgz")
 
 WORMS_URL = "https://www.marinespecies.org/rest"
 
 WORMS_CACHE = {}
+
+def sparse_sequence(aligned_sequence: str) -> tuple[np.ndarray, np.ndarray]:
+    encoded = np.frombuffer(aligned_sequence.encode("ascii"), dtype=np.uint8)
+    positions = np.flatnonzero(encoded != ord("-")).astype(np.uint16)
+    bases = encoded[positions].copy()
+    return positions, bases
 
 
 def get_worms_taxonomy(description: str):
@@ -103,6 +112,10 @@ def main():
         records.append(record)
 
     df_fasta = pd.DataFrame.from_records(records)
+
+    with tarfile.open(SILVA_TGZ, encoding="utf-8", errors="replace") as text_in:
+        for record in tqdm(SeqIO.parse(text_in, "fasta"), desc="Loading sequences"):
+
 
     df_genera = pd.read_excel(INPUT_GENERA)
 

@@ -1,11 +1,10 @@
 import hashlib
 import heapq
-import io
-import tarfile
 from array import array
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 from urllib.parse import quote
 
 import numpy as np
@@ -14,6 +13,13 @@ import requests
 from Bio import SeqIO
 from src.common import parse_config
 from tqdm import tqdm
+
+
+@dataclass
+class Config:
+    input_fasta: Path
+    output_parquet: Path
+    header_type: Literal["ncbi", "silva"]
 
 
 @dataclass
@@ -29,17 +35,21 @@ class SequenceInfo:
     first_column: int
     last_column: int
 
-    worms_match_aphiaid: str | None
-    worms_match_rank: str | None
-    worms_match_name: str | None
-    worms_match_genus: str | None
-    worms_match_ismarine: bool | None
+    worms_aphiaid: str | None = None
+    worms_rank: str | None = None
+    worms_name: str | None = None
+    worms_genus: str | None = None
+    worms_ismarine: bool | None = None
 
-    worms_valid_name: str | None
-    worms_valid_genus: str | None
+    worms_valid_name: str | None = None
+    worms_valid_genus: str | None = None
 
     duplicate_of: str | None = None
     contained_by: str | None = None
+
+    @property
+    def fasta_header(self) -> str:
+        return f"{self.accession} {self.description}"
 
     @property
     def positions(self) -> np.ndarray:
@@ -50,26 +60,28 @@ class SequenceInfo:
         return np.frombuffer(self.bases_bytes, dtype=np.uint8)
 
     @property
-    def ungapped_sequence(self) -> str:
-        return self.bases_bytes.decode("ascii")
+    def aligned_sequence(self) -> str:
+        seq = np.full(50000, ord("-"), dtype=np.uint8)
+        seq[self.positions] = self.bases
+        return seq.tobytes().decode("ascii")
 
 
 def sequence_nomalization_dict() -> dict[int, int]:
-    IUPAC_CHARS = "ACGTRYSWKMBDHVN"
-    GAP_CHARS = "-.~_"
+    iupac_chars = "ACGTRYSWKMBDHVN"
+    gap_chars = "-.~_"
 
-    TRANS_DICT: dict[int, int] = {}
-    for c in IUPAC_CHARS:
-        TRANS_DICT[ord(c)] = ord(c)
-        TRANS_DICT[ord(c.lower())] = ord(c)
-    TRANS_DICT[ord("U")] = ord("T")
-    TRANS_DICT[ord("u")] = ord("T")
-    for c in GAP_CHARS:
-        TRANS_DICT[ord(c)] = ord("-")
+    trans_dict: dict[int, int] = {}
+    for c in iupac_chars:
+        trans_dict[ord(c)] = ord(c)
+        trans_dict[ord(c.lower())] = ord(c)
+    trans_dict[ord("U")] = ord("T")
+    trans_dict[ord("u")] = ord("T")
+    for c in gap_chars:
+        trans_dict[ord(c)] = ord("-")
 
-    TRANS_DICT.update({i: ord("N") for i in range(256) if i not in TRANS_DICT})
+    trans_dict.update({i: ord("N") for i in range(256) if i not in trans_dict})
 
-    return TRANS_DICT
+    return trans_dict
 
 
 def ambiguity_fraction(bases: np.ndarray) -> float:
@@ -87,39 +99,30 @@ def sparse_sequence(aligned_sequence: str) -> tuple[np.ndarray, np.ndarray]:
     return positions, bases
 
 
-def get_worms_taxonomy(queries: list[str], worms_cache: dict):
-
+def get_worms_taxonomy(queries: list[str], worms_cache: dict) -> dict[str, str] | None:
     worms_url = "https://www.marinespecies.org/rest"
     params = {"like": "false", "marine_only": "false"}
 
-    def query_worms(query: str, params: dict[str, str] = params):
+    def query_worms(query: str):
         if query in worms_cache:
             return worms_cache[query]
 
         url = f"{worms_url}/AphiaRecordsByName/{quote(query)}"
 
-        try:
-            response = requests.get(url, params=params)
-            if response.status_code == 204:
-                raise requests.exceptions.HTTPError(
-                    "204 No Content: Server returned an empty response.", response=response
-                )
-            response.raise_for_status()
+        response = requests.get(url, params=params)
+        if response.status_code in [404, 204]:
+            return None
 
-            records = response.json()
-            records = [r for r in records if r["phylum"] == "Nematoda"]
-            if len(records) > 1:
-                records = [r for r in records if r["status"] == "accepted"]
-            if len(records) > 1:
-                records = [r for r in records if r["rank"] in ["Genus", "Species"]]
-            if len(records) > 1:
-                raise RuntimeError(f"Multiple appected nematode WoRMS records found for: {query}")
+        records: list[dict] = response.json()
+        records = [r for r in records if r["phylum"] == "Nematoda"]
+        if len(records) > 1:
+            records = [r for r in records if r["status"] == "accepted"]
+        if len(records) > 1:
+            records = [r for r in records if r["rank"] in ["Genus", "Species"]]
+        if len(records) > 1:
+            raise RuntimeError(f"Multiple appected nematode WoRMS records found for: {query}")
 
-            record = records[0] if records else None
-
-        except requests.exceptions.HTTPError:
-            record = None
-
+        record = records[0] if records else None
         worms_cache[query] = record
 
         return record
@@ -133,108 +136,84 @@ def get_worms_taxonomy(queries: list[str], worms_cache: dict):
     return record
 
 
-@dataclass
-class Config:
-    input_fasta: Path
-    output_database: Path
-
-
 def main() -> None:
     snakemake = globals().get("snakemake", None)
     cfg = parse_config(Config, snakemake)
 
+    # ---------------------------------------
+    # 1. Load sequences into sparse objects
+    # ---------------------------------------
     alignment_length = None
     sequences: list[SequenceInfo] = []
-
     trans_dict = sequence_nomalization_dict()
 
-    worms_cache = {}
+    for record in tqdm(SeqIO.parse(cfg.input_fasta, "fasta"), desc="Loading sequences"):
+        if alignment_length is None:
+            alignment_length = len(record.seq)
+        elif len(record.seq) != alignment_length:
+            raise ValueError(
+                f"Inconsistent alignment length for {record.id}: "
+                f"{len(record.seq)} != {alignment_length}"
+            )
 
-    # sqlite_url = f"sqlite:///{cfg.output_database}"
-    # engine = create_engine(sqlite_url)
-    # SQLModel.metadata.create_all(engine)
+        normalized_seq = str(record.seq).translate(trans_dict)
+        positions, bases = sparse_sequence(normalized_seq)
 
-    with tarfile.open(cfg.input_fasta, "r:gz") as tar:
-        member = tar.getmembers()[0]
-        tar_file = tar.extractfile(member)
-        if tar_file is None:
-            raise TypeError(f"Could not extract data from: {member.name}")
+        accession = record.id
+        description = record.description.removeprefix(accession).strip()
 
-        with io.TextIOWrapper(tar_file, encoding="utf-8", errors="replace") as text_in:
-            for record in tqdm(SeqIO.parse(text_in, "fasta"), desc="Loading sequences"):
-                if alignment_length is None:
-                    alignment_length = len(record.seq)
-                elif len(record.seq) != alignment_length:
-                    raise ValueError(
-                        f"Inconsistent alignment length for {record.id}: "
-                        f"{len(record.seq)} != {alignment_length}"
-                    )
-
-                normalized_seq = str(record.seq).translate(trans_dict)
-
-                positions, bases = sparse_sequence(normalized_seq)
-
-                accession = record.id
-                description = record.description.removeprefix(accession).strip()
-                tax_fields = description.split(";")
-
-                hyp_order = tax_fields[-2]
-                species_words = tax_fields[-1].split()
-                hyp_genus = species_words[0]
-                if len(species_words) > 1:
-                    hyp_species = f"{species_words[0]} {species_words[1]}"
-                    worms_queries = [hyp_species, hyp_genus, hyp_order]
-                else:
-                    worms_queries = [hyp_genus, hyp_order]
-
-                worms_record = get_worms_taxonomy(worms_queries, worms_cache)
-                if worms_record is not None:
-                    worms_match_aphiaid = worms_record["AphiaID"]
-                    worms_match_rank = worms_record["rank"]
-                    worms_match_name = worms_record["scientificname"]
-                    worms_match_genus = (
-                        worms_match_name.split()[0]
-                        if worms_match_rank in ["Genus", "Species"]
-                        else None
-                    )
-                    worms_match_ismarine = worms_record["isMarine"]
-
-                    worms_valid_name = worms_record["valid_name"]
-                    worms_valid_genus = (
-                        worms_valid_name.split()[0]
-                        if worms_valid_name is not None and worms_match_rank in ["Genus", "Species"]
-                        else None
-                    )
-                else:
-                    worms_match_aphiaid = worms_match_rank = worms_match_name = (
-                        worms_match_genus
-                    ) = worms_match_ismarine = worms_valid_name = worms_valid_genus = None
-
-                sequences.append(
-                    SequenceInfo(
-                        accession=accession,
-                        description=description,
-                        positions_bytes=positions.tobytes(),
-                        bases_bytes=bases.tobytes(),
-                        length=len(positions),
-                        ambiguity_fraction=ambiguity_fraction(bases),
-                        first_column=int(positions[0]),
-                        last_column=int(positions[-1]),
-                        worms_match_aphiaid=worms_match_aphiaid,
-                        worms_match_rank=worms_match_rank,
-                        worms_match_name=worms_match_name,
-                        worms_match_genus=worms_match_genus,
-                        worms_match_ismarine=worms_match_ismarine,
-                        worms_valid_name=worms_valid_name,
-                        worms_valid_genus=worms_valid_genus,
-                    )
-                )
-
-    if alignment_length is None:
-        raise ValueError("No FASTA records were found.")
+        sequences.append(
+            SequenceInfo(
+                accession=accession,
+                description=description,
+                positions_bytes=positions.tobytes(),
+                bases_bytes=bases.tobytes(),
+                length=len(positions),
+                ambiguity_fraction=ambiguity_fraction(bases),
+                first_column=int(positions[0]),
+                last_column=int(positions[-1]),
+            )
+        )
 
     # -------------------------------------------
-    # 2. Exact alignment containement filtering
+    # 2. WoRMS taxonomic reconciliation
+    # -------------------------------------------
+    worms_cache = {}
+
+    for seq in tqdm(sequences, desc="WoRMS taxonomic reconciliation"):
+        if cfg.header_type == "ncbi":
+            desc_fields = seq.description.split()
+            hyp_genus = desc_fields[0]
+            hyp_species = f"{desc_fields[0]} {desc_fields[1]}" if len(desc_fields) > 1 else None
+        elif cfg.header_type == "silva":
+            desc_fields = seq.description.split(";")
+            species_words = desc_fields[-1].split()
+            hyp_genus = species_words[0]
+            hyp_species = (
+                f"{species_words[0]} {species_words[1]}" if len(species_words) > 1 else None
+            )
+        worms_queries = [q for q in [hyp_species, hyp_genus] if q is not None]
+
+        worms_record = get_worms_taxonomy(worms_queries, worms_cache)
+        if worms_record is None:
+            continue
+
+        seq.worms_aphiaid = worms_record["AphiaID"]
+        seq.worms_rank = worms_record["rank"]
+        seq.worms_name = worms_record["scientificname"]
+        seq.worms_genus = (
+            seq.worms_name.split()[0] if seq.worms_rank in ["Genus", "Species"] else None
+        )
+        seq.worms_ismarine = bool(worms_record["isMarine"])
+        seq.worms_valid_name = worms_record["valid_name"]
+        seq.worms_valid_genus = (
+            seq.worms_valid_name.split()[0]
+            if seq.worms_valid_name is not None and seq.worms_rank in ["Genus", "Species"]
+            else None
+        )
+
+    # -------------------------------------------
+    # 3. Exact alignment containement filtering
     # -------------------------------------------
 
     # Collect aligned sequence hashed for detecting exact duplicates
@@ -264,7 +243,9 @@ def main() -> None:
         else:
             dup_seq = sequences[dup_idx]
             short_seq.duplicate_of = dup_seq.accession
-            short_seq.contained_by = dup_seq.contained_by
+            short_seq.contained_by = (
+                dup_seq.contained_by if dup_seq.contained_by is not None else dup_seq.accession
+            )
             continue
 
         # Sequences start uncontained until proven otherwise.
@@ -324,12 +305,11 @@ def main() -> None:
                 token_index[(int(pos), int(base))].append(seq_idx)
 
     # -------------------------------------------
-    # 3. WoRMS taxonomic reconciliation
+    # 4. Save to compressed dataframe
     # -------------------------------------------
 
     df = pd.DataFrame(sequences)
-
-    breakpoint()
+    df.to_parquet(cfg.output_parquet)
 
 
 if __name__ == "__main__":

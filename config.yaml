@@ -1,6 +1,6 @@
 project:
   version: 1.0
-  seed: 69
+  seed: 1906
   data_dir: data
   output_dir: output
   log_dir: output/logs
