@@ -13,10 +13,30 @@ from tqdm import tqdm
 
 @dataclass
 class Config:
-    input_fasta: Path
-    input_uc: Path
-    input_outgroup: Path
+    input_ref_fasta: Path
+    input_ref_uc: Path
+    input_out_fasta: Path
+    input_otu_fasta: Path
     output_parquet: Path
+
+
+@dataclass
+class SequenceInfo:
+    accession: str
+    description: str
+    length: int
+    rna_seq: np.ndarray
+    msa_pos: np.ndarray
+    first_pos: int
+    last_pos: int
+    is_outgroup: bool
+    is_otu: bool
+    worms_aphiaid: int | None = None
+    worms_rank: str | None = None
+    worms_ismarine: bool | None = None
+    worms_name: str | None = None
+    worms_valid_name: str | None = None
+    worms_valid_genus: str | None = None
 
 
 def get_worms_taxonomy(queries: list[str], worms_cache: dict) -> dict[str, str] | None:
@@ -60,29 +80,39 @@ def get_worms_taxonomy(queries: list[str], worms_cache: dict) -> dict[str, str] 
 def process_record(
     seq: skbio.RNA,
     alignment_length: int,
-    cols: dict[str, list],
-    silva_header: bool,
-    is_outgroup: bool,
-    worms_cache: dict,
-) -> None:
+    silva_header: bool = False,
+    is_outgroup: bool = False,
+    is_otu: bool = False,
+    worms_cache: dict | None = None,
+) -> SequenceInfo:
     if len(seq) != alignment_length:
         raise ValueError(
             f"Inconsistent alignment length for {seq.metadata['id']}: "
             f"{len(seq)} != {alignment_length}"
         )
 
-    cols["accession"].append(seq.metadata["id"])
-    cols["description"].append(seq.metadata["description"])
-
     seq_bytes: np.ndarray = seq.values
     non_gap_mask = (seq_bytes != b"-") & (seq_bytes != b".")
     ungapped_seq = seq_bytes[non_gap_mask].view(np.uint8)
-    cols["rna_seq"].append(ungapped_seq)
-
     positions = np.flatnonzero(non_gap_mask).astype(np.uint16)
-    cols["msa_pos"].append(positions)
 
-    cols["is_outgroup"].append(is_outgroup)
+    seq_info = SequenceInfo(
+        accession=seq.metadata["id"],
+        description=seq.metadata["description"],
+        length=len(ungapped_seq),
+        rna_seq=ungapped_seq,
+        msa_pos=positions,
+        first_pos=positions[0],
+        last_pos=positions[-1],
+        is_outgroup=is_outgroup,
+        is_otu=is_otu,
+    )
+
+    if is_otu:
+        return seq_info
+
+    if worms_cache is None:
+        worms_cache = {}
 
     if silva_header:
         fields = seq.metadata["description"].split(";")[-1].split()
@@ -96,12 +126,13 @@ def process_record(
     if worms_record is None:
         raise RuntimeError(f"No WoRMS record found for: {seq.metadata['description']}")
 
-    cols["worms_aphiaid"].append(int(worms_record["AphiaID"]))
-    cols["worms_rank"].append(worms_record["rank"])
-    cols["worms_ismarine"].append(bool(worms_record["isMarine"]))
-    cols["worms_name"].append(worms_record["scientificname"])
-    cols["worms_valid_name"].append(worms_record["valid_name"])
-    cols["worms_valid_genus"].append(worms_record["valid_name"].split()[0])
+    seq_info.worms_aphiaid = int(worms_record["AphiaID"])
+    seq_info.worms_rank = worms_record["rank"]
+    seq_info.worms_ismarine = bool(worms_record["isMarine"])
+    seq_info.worms_valid_name = worms_record["valid_name"]
+    seq_info.worms_valid_genus = seq_info.worms_valid_name.split()[0]
+
+    return seq_info
 
 
 def main() -> None:
@@ -110,50 +141,56 @@ def main() -> None:
     cfg = parse_config(Config, snakemake)
 
     # Intermediate structure for saving record data
-    cols = {
-        "accession": [],
-        "description": [],
-        "rna_seq": [],
-        "msa_pos": [],
-        "is_outgroup": [],
-        "worms_aphiaid": [],
-        "worms_rank": [],
-        "worms_ismarine": [],
-        "worms_name": [],
-        "worms_valid_name": [],
-        "worms_valid_genus": [],
-    }
+    sequence_rows = []
     worms_cache = {}
     alignment_length = 50000
 
-    # First process the outgroup sequences
-    seq: skbio.RNA
-    for seq in skbio.read(cfg.input_outgroup, format="fasta", constructor=skbio.RNA):
-        process_record(
-            seq=seq,
-            cols=cols,
-            alignment_length=alignment_length,
-            silva_header=True,
-            is_outgroup=True,
-            worms_cache=worms_cache,
-        )
-
-    # Read each sequence, saving the sparse alignment representation
+    # Read each reference sequence, saving the sparse alignment representation
     seq: skbio.RNA
     for seq in tqdm(
-        skbio.read(cfg.input_fasta, format="fasta", constructor=skbio.RNA), desc="Loading sequences"
+        skbio.read(cfg.input_ref_fasta, format="fasta", constructor=skbio.RNA),
+        desc="Processing reference sequences",
     ):
-        process_record(
-            seq=seq,
-            cols=cols,
-            alignment_length=alignment_length,
-            silva_header=False,
-            is_outgroup=False,
-            worms_cache=worms_cache,
+        sequence_rows.append(
+            process_record(
+                seq=seq,
+                alignment_length=alignment_length,
+                worms_cache=worms_cache,
+            )
+        )
+
+    # Now process the outgroup sequences
+    seq: skbio.RNA
+    for seq in tqdm(
+        skbio.read(cfg.input_out_fasta, format="fasta", constructor=skbio.RNA),
+        desc="Processing outgroup sequences",
+    ):
+        sequence_rows.append(
+            process_record(
+                seq=seq,
+                alignment_length=alignment_length,
+                silva_header=True,
+                is_outgroup=True,
+                worms_cache=worms_cache,
+            )
+        )
+
+    # Finally process the OTU sequences
+    seq: skbio.RNA
+    for seq in tqdm(
+        skbio.read(cfg.input_otu_fasta, format="fasta", constructor=skbio.RNA),
+        desc="Processing OTU sequences",
+    ):
+        sequence_rows.append(
+            process_record(
+                seq=seq,
+                alignment_length=alignment_length,
+                is_otu=True,
+            )
         )
 
     # Save to a PyArrow backed Pandas Dataframe
-    pa_table = pa.Table.from_pydict(cols)
+    pa_table = pa.Table.from_pylist([s.__dict__ for s in sequence_rows])
     df_seq: pd.DataFrame = pa_table.to_pandas(types_mapper=pd.ArrowDtype)
 
     df_seq.set_index("accession", inplace=True)
@@ -174,7 +211,7 @@ def main() -> None:
         "clust_target",
     ]
     df_uc = pd.read_csv(
-        cfg.input_uc,
+        cfg.input_ref_uc,
         sep="\t",
         names=uc_headers,
         na_values="*",
@@ -186,12 +223,15 @@ def main() -> None:
 
     df_uc["target_length"] = df_uc["clust_target"].map(df_uc["length"])
     exact_match = df_uc["clust_pct_identity"] == 100.0
-    df_uc["clust_duplicate"] = exact_match & (df_uc["length"] == df_uc["target_length"])
-    df_uc["clust_contained"] = exact_match & (df_uc["length"] != df_uc["target_length"])
+    df_uc["clust_duplicate"] = exact_match & (df_uc["length"] == df_uc["target_length"]).fillna(
+        False
+    )
+    df_uc["clust_contained"] = exact_match & (df_uc["length"] != df_uc["target_length"]).fillna(
+        False
+    )
     df_uc["clust_centroid"] = df_uc["record_type"] == "S"
 
     keep_headers = [
-        "length",
         "clust_id",
         "clust_pct_identity",
         "clust_target",

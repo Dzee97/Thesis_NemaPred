@@ -15,13 +15,17 @@ from tqdm import tqdm
 class Config:
     input_parquet: Path
     output_fasta: Path
+    output_outgroup: Path
+    output_genus_cov: Path
     no_duplicates: bool
     no_contained: bool
-    only_cluster_centroids: bool
+    only_centroids: bool
+    otu_coverage: float
     min_length: int
     dist_model: str
     model_gamma: float
     max_z_score: float
+    k_closest: int
 
 
 def print_phylo_z_distribution(z_arr, outlier_threshold=2.5):
@@ -91,6 +95,33 @@ def print_phylo_z_distribution(z_arr, outlier_threshold=2.5):
     print("-" * 85)
 
 
+def create_compressed_alignment(df: pd.DataFrame) -> list[skbio.RNA]:
+    positions_array = pa.array(df.msa_pos)
+    combined_positions = positions_array.flatten()
+    active_positions = combined_positions.unique().sort().to_numpy()
+
+    aligned_sequences: list[skbio.RNA] = []
+    for _, row in df.iterrows():
+        aligned_bytes = np.full(len(active_positions), ord("-"), dtype=np.uint8)
+        insert_indices = np.searchsorted(active_positions, row.msa_pos)
+        aligned_bytes[insert_indices] = row.rna_seq
+        aligned_sequences.append(skbio.RNA(aligned_bytes))
+
+    return aligned_sequences
+
+
+def update_genus_coverage(
+    df: pd.DataFrame, label: str, old_genus_cov: pd.DataFrame | None = None
+) -> pd.DataFrame:
+    genus_cov = df.groupby("worms_valid_genus").agg({"length": "count"})
+    genus_cov.rename(columns={"length": label}, inplace=True)
+
+    if old_genus_cov is None:
+        return genus_cov
+
+    return old_genus_cov.join(genus_cov).fillna(0)
+
+
 def main():
     snakemake = globals().get("snakemake", None)
     cfg = parse_config(Config, snakemake)
@@ -99,39 +130,76 @@ def main():
     df: pd.DataFrame = pa_table.to_pandas(types_mapper=pd.ArrowDtype, ignore_metadata=True)
     df.set_index("accession", inplace=True)
 
-    df = df[
-        (df["is_outgroup"] == True)
-        | ((df["length"] >= cfg.min_length) & (df["clust_centroid"] == cfg.only_cluster_centroids))
-    ]
+    df_ref = df[(~df.is_outgroup) & (~df.is_otu)]
+    df_out = df[df.is_outgroup]
+    df_otu = df[df.is_otu]
 
-    positions_array = pa.array(df.msa_pos)
-    combined_positions = positions_array.flatten()
-    active_positions = combined_positions.unique().sort().to_numpy()
+    genus_cov = update_genus_coverage(df_ref, "start")
 
-    aligned_sequences: list[skbio.RNA] = []
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="Creating compressed filtered alignment"):
-        aligned_bytes = np.full(len(active_positions), ord("-"), dtype=np.uint8)
-        insert_indices = np.searchsorted(active_positions, row.msa_pos)
-        aligned_bytes[insert_indices] = row.rna_seq
-        aligned_sequences.append(skbio.RNA(aligned_bytes))
+    if cfg.no_duplicates:
+        df_ref = df_ref[~df_ref.clust_duplicate]
+    if cfg.no_contained:
+        df_ref = df_ref[~df_ref.clust_contained]
+    if cfg.only_centroids:
+        df_ref = df_ref[df_ref.clust_centroid]
 
-    msa = skbio.TabularMSA(aligned_sequences)
+    genus_cov = update_genus_coverage(df_ref, "only centroids", genus_cov)
+
+    otu_frame_start = df_otu.first_pos.median()
+    otu_frame_end = df_otu.last_pos.median()
+
+    df_ref["otu_coverage"] = np.maximum(
+        0,
+        np.minimum(otu_frame_end, df_ref.last_pos) - np.maximum(otu_frame_start, df_ref.first_pos),
+    ) / (otu_frame_end - otu_frame_start)
+    df_ref = df_ref[df_ref.otu_coverage >= cfg.otu_coverage]
+
+    genus_cov = update_genus_coverage(df_ref, f"OTU coverage >= {cfg.otu_coverage}", genus_cov)
+
+    msa = skbio.TabularMSA(create_compressed_alignment(df_ref))
     dist = align_dists(msa, metric=cfg.dist_model, gamma=cfg.model_gamma, shared_by_all=False)
 
-    mean_dist = np.nanmedian(dist.data, axis=0)
+    mean_dist = np.nanmedian(dist.data, axis=1)
     z_scores = (mean_dist - mean_dist.mean()) / mean_dist.std()
 
     print_phylo_z_distribution(z_scores, outlier_threshold=cfg.max_z_score)
 
-    keep_indices = np.flatnonzero((z_scores <= cfg.max_z_score) | df.is_outgroup.to_numpy())
+    keep_indices = np.flatnonzero(z_scores <= cfg.max_z_score)
+    df_ref = df_ref.iloc[keep_indices]
+
+    genus_cov = update_genus_coverage(df_ref, f"dist Z-score <= {cfg.max_z_score}", genus_cov)
+
+    dist = dist[np.ix_(keep_indices, keep_indices)]
+    k_closest = np.argpartition(dist, kth=cfg.k_closest + 1, axis=1)[:, 1 : cfg.k_closest + 1]
+    genera = df_ref.worms_valid_genus.to_numpy()
+
+    _, inverse, counts = np.unique(genera, return_counts=True, return_inverse=True)
+    is_singleton = counts[inverse] == 1
+
+    closest_genera = genera[k_closest]
+    own_genus = genera[:, None]
+
+    matches_closest = np.any(closest_genera == own_genus, axis=1) | is_singleton
+    df_ref = df_ref.iloc[matches_closest]
+
+    genus_cov = update_genus_coverage(df_ref, f"same genus in dist top {cfg.k_closest}", genus_cov)
+
+    df_final = df.loc[df_ref.index.union(df_out.index)]
 
     with open(cfg.output_fasta, "w") as f:
         f.writelines(
             f">{accession}_{row.worms_valid_genus}\n{seq}\n"
             for (accession, row), seq in zip(
-                df.iloc[keep_indices].iterrows(), msa.iloc[keep_indices]
+                df_final.iterrows(), create_compressed_alignment(df_final)
             )
         )
+
+    with open(cfg.output_outgroup, "w") as f:
+        f.write(
+            ",".join(f"{accession}_{row.worms_valid_genus}" for accession, row in df_out.iterrows())
+        )
+
+    genus_cov.to_csv(cfg.output_genus_cov)
 
 
 if __name__ == "__main__":

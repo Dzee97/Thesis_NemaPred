@@ -20,6 +20,14 @@ rule create_metabarcoding_18s_fasta:
     script:
         "scripts/preprocess_otus.py"
 
+rule create_bold_18s_fasta:
+    input:
+        input_tsv = RAW_DATA_DIR / "BOLD" / "BOLD_Nematodes.tsv"
+    output:
+        output_fasta = PROCESSED_DATA_DIR / "BOLD_18s_sequences.fasta"
+    script:
+        "scripts/preprocess_bold.py"
+
 rule create_metabarcoding_18s_alignment:
     input:
         input_arb = RAW_DATA_DIR / "SILVA" / "SILVA_144_SSURef_NR99_opt.arb",
@@ -48,44 +56,50 @@ rule create_marnemafundiv_18s_alignment:
     shell:
         "sina -i {input.input_fasta} -r {input.input_arb} -o {output.output_fasta}"
 
-rule process_marnemafundiv_18s_alignment:
+rule process_18s_alignments:
     input:
-        input_fasta = PROCESSED_DATA_DIR / "MarNemaFunDiv_18S_sequences_aligned.fasta",
-        input_uc = PROCESSED_DATA_DIR / "MarNemaFunDiv_18S_sequences_combined.uc",
-        input_outgroup = RAW_DATA_DIR / "SILVA" / "outgroups.fasta"
+        input_ref_fasta = PROCESSED_DATA_DIR / "MarNemaFunDiv_18S_sequences_aligned.fasta",
+        input_ref_uc = PROCESSED_DATA_DIR / "MarNemaFunDiv_18S_sequences_combined.uc",
+        input_out_fasta = RAW_DATA_DIR / "SILVA" / "outgroups.fasta",
+        input_otu_fasta = PROCESSED_DATA_DIR / "Metabarcoding_18S_OTUs_aligned.fasta"
     output:
         output_parquet = PROCESSED_DATA_DIR / "MarNemaFunDiv_18S_sequences_processed.parquet"
     script:
         "scripts/preprocess_sequences.py"
 
-rule filter_marnemafundiv_18s_alignment:
+rule create_phylogeny_18s_alignment:
     input:
         input_parquet = PROCESSED_DATA_DIR / "MarNemaFunDiv_18S_sequences_processed.parquet"
     params:
         no_duplicates = False,
         no_contained = False,
-        only_cluster_centroids = True,
+        only_centroids = True,
+        otu_coverage = 0.8,
         min_length = 500,
         dist_model = "tn93",
         model_gamma = 1.0,
-        max_z_score = 1.0
+        max_z_score = 2.5,
+        k_closest = 20
     output:
-        output_fasta = PROCESSED_DATA_DIR / "MarNemaFunDiv_18S_sequences_filtered.fasta"
+        output_fasta = PROCESSED_DATA_DIR / "MarNemaFunDiv_18S_sequences_filtered.fasta",
+        output_outgroup = PROCESSED_DATA_DIR / "MarNemaFunDiv_18S_sequences_filtered.outgroup",
+        output_genus_cov = PROCESSED_DATA_DIR / "Genus_coverage.csv"
     script:
         "scripts/filter_sequences.py"
 
 
-rule tree_marnemafundiv_18s_alignment:
+rule create_phylogeny_18s_tree:
     input:
-        input_fasta = PROCESSED_DATA_DIR / "MarNemaFunDiv_18S_sequences_filtered.fasta"
+        input_fasta = PROCESSED_DATA_DIR / "MarNemaFunDiv_18S_sequences_filtered.fasta",
+        input_outgroup = PROCESSED_DATA_DIR / "MarNemaFunDiv_18S_sequences_filtered.outgroup"
     params:
         model = "GTR+G+I",
         raxml_dir = RAXML_DATA_DIR,
-        prefix_final = RAXML_DATA_DIR  / "Final_MarNemaFunDiv_18S_sequences"
+        prefix_final = RAXML_DATA_DIR  / "Tree_MarNemaFunDiv_18S_sequences"
     output:
-        out_best_tree = RAXML_DATA_DIR / "Eval_MarNemaFunDiv_18S_sequences.raxml.bestTree"
+        out_best_tree = RAXML_DATA_DIR / "Tree_MarNemaFunDiv_18S_sequences.raxml.bestTree"
     shell:
         """
         mkdir -p {params.raxml_dir}
-        raxml-ng --search --model {params.model} --msa {input.input_fasta} --prefix {params.prefix_final} --seed {SEED}
+        raxml-ng --search --model {params.model} --msa {input.input_fasta} --prefix {params.prefix_final} --seed {SEED} --outgroup $(cat {input.input_outgroup}) --tree pars{{20}},rand{{20}}
         """
