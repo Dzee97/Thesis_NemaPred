@@ -113,7 +113,7 @@ rule filter_18s_sequences:
         max_ambiguity = 0.01,
         otu_coverage = 0.8,
         dist_model = "tn93",
-        model_gamma = 1.0,
+        model_gamma = 0.4,
         max_z_score = 3,
         k_closest = 20
     output:
@@ -137,5 +137,5 @@ rule create_18s_tree:
     shell:
         """
         mkdir -p {params.raxml_dir}
-        raxml-ng --search --model {params.model} --msa {input.input_fasta} --prefix {params.prefix_final} --seed {SEED} --outgroup $(cat {input.input_outgroup}) --tree pars{{20}},rand{{20}}
+        raxml-ng --search --model {params.model} --msa {input.input_fasta} --prefix {params.prefix_final} --seed {SEED} --outgroup $(cat {input.input_outgroup}) --tree pars{{25}},rand{{25}}
         """

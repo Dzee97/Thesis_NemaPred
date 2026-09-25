@@ -165,7 +165,7 @@ def main():
     genus_cov = update_genus_coverage(df_ref, f"OTU coverage >= {cfg.otu_coverage}", genus_cov)
 
     df_ref = df_ref.sort_values(
-        ["worms_valid_genus", "clust_id", "otu_coverage", "length", "ambiguity_frac"],
+        ["worms_valid_genus", "clust_id", "length", "otu_coverage", "ambiguity_frac"],
         ascending=[True, True, False, False, True],
     )
 
@@ -189,7 +189,7 @@ def main():
 
     genus_cov = update_genus_coverage(df_ref, f"Dist Z-score <= {cfg.max_z_score}", genus_cov)
 
-    genera = df_ref.worms_vald_genus.to_numpy()
+    genera = df_ref.worms_valid_genus.to_numpy()
     median_genus_dist = np.full(len(genera), np.nan)
 
     for genus in np.unique(genera):
@@ -205,7 +205,7 @@ def main():
     df_ref["median_genus_dist"] = median_genus_dist
 
     df_ref = df_ref.sort_values(
-        ["worms_valid_genus", "median_genus_dist", "otu_coverage", "length", "ambiguity_frac"],
+        ["worms_valid_genus", "median_genus_dist", "length", "otu_coverage", "ambiguity_frac"],
         ascending=[True, True, False, False, True],
     )
 
