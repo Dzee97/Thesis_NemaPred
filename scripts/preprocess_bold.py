@@ -23,10 +23,13 @@ def main() -> None:
         usecols=["sampleid", "genus", "species", "nuc", "marker_code"],
     )
     df = df[df.marker_code.str.startswith("18S")]
+    df = df[~df.genus.isna()]
+
+    print(f"Writing {len(df)} BOLD Nematode records to fasta file")
 
     with open(cfg.output_fasta, "w") as f:
         f.writelines(
-            f">{row.sampleid} {row.genus};{row.species}\n{skbio.DNA(row.nuc).degap().transcribe()}\n"
+            f">BOLD|{row.sampleid} {row.genus};{row.species}\n{skbio.DNA(row.nuc).degap().transcribe()}\n"
             for _, row in df.iterrows()
         )
 

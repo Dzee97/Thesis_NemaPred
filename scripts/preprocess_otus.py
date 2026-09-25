@@ -21,7 +21,8 @@ def main() -> None:
 
     with open(cfg.output_fasta, "w") as f:
         f.writelines(
-            f">OTU{idx}\n{skbio.DNA(seq).transcribe()}\n" for idx, seq in df.sequence.items()
+            f">OTU{idx}\n{skbio.DNA(seq).degap().transcribe()}\n"
+            for idx, seq in df.sequence.items()
         )
 
 

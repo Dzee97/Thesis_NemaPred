@@ -1,5 +1,7 @@
+import pickle
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 from urllib.parse import quote
 
 import numpy as np
@@ -15,9 +17,10 @@ from tqdm import tqdm
 class Config:
     input_ref_fasta: Path
     input_ref_uc: Path
-    input_out_fasta: Path
     input_otu_fasta: Path
+    input_out_fasta: Path
     output_parquet: Path
+    worms_cache: Path
 
 
 @dataclass
@@ -25,12 +28,12 @@ class SequenceInfo:
     accession: str
     description: str
     length: int
+    ambiguity_frac: float
     rna_seq: np.ndarray
     msa_pos: np.ndarray
     first_pos: int
     last_pos: int
-    is_outgroup: bool
-    is_otu: bool
+    seq_type: Literal["ref", "outgroup", "otu"]
     worms_aphiaid: int | None = None
     worms_rank: str | None = None
     worms_ismarine: bool | None = None
@@ -51,6 +54,7 @@ def get_worms_taxonomy(queries: list[str], worms_cache: dict) -> dict[str, str] 
 
         response = requests.get(url, params=params)
         if response.status_code in [404, 204]:
+            worms_cache[query] = None
             return None
 
         records: list[dict] = response.json()
@@ -80,9 +84,7 @@ def get_worms_taxonomy(queries: list[str], worms_cache: dict) -> dict[str, str] 
 def process_record(
     seq: skbio.RNA,
     alignment_length: int,
-    silva_header: bool = False,
-    is_outgroup: bool = False,
-    is_otu: bool = False,
+    seq_type: Literal["ref", "outgroup", "otu"],
     worms_cache: dict | None = None,
 ) -> SequenceInfo:
     if len(seq) != alignment_length:
@@ -91,48 +93,65 @@ def process_record(
             f"{len(seq)} != {alignment_length}"
         )
 
-    seq_bytes: np.ndarray = seq.values
-    non_gap_mask = (seq_bytes != b"-") & (seq_bytes != b".")
-    ungapped_seq = seq_bytes[non_gap_mask].view(np.uint8)
+    non_gap_mask = ~seq.gaps()
+    ungapped_seq = seq.degap().values.view(np.uint8)
     positions = np.flatnonzero(non_gap_mask).astype(np.uint16)
+
+    length = len(ungapped_seq)
+    ambiguity_frac = seq.degenerates().sum() / length
 
     seq_info = SequenceInfo(
         accession=seq.metadata["id"],
         description=seq.metadata["description"],
-        length=len(ungapped_seq),
+        length=length,
+        ambiguity_frac=ambiguity_frac,
         rna_seq=ungapped_seq,
         msa_pos=positions,
         first_pos=positions[0],
         last_pos=positions[-1],
-        is_outgroup=is_outgroup,
-        is_otu=is_otu,
+        seq_type=seq_type,
     )
 
-    if is_otu:
+    if seq_type == "otu":
         return seq_info
 
     if worms_cache is None:
         worms_cache = {}
 
-    if silva_header:
-        fields = seq.metadata["description"].split(";")[-1].split()
-    else:
-        fields = seq.metadata["description"].split()
-    hyp_genus = fields[0]
-    hyp_species = " ".join(fields[:2]) if len(fields) > 1 else None
-
-    worms_queries = [q for q in [hyp_species, hyp_genus] if q is not None]
+    hyp_genus, hyp_species = seq.metadata["description"].split(";")
+    worms_queries = [hyp_species, hyp_genus]
     worms_record = get_worms_taxonomy(worms_queries, worms_cache)
     if worms_record is None:
-        raise RuntimeError(f"No WoRMS record found for: {seq.metadata['description']}")
+        return seq_info
+        # raise RuntimeError(f"No WoRMS record found for: {seq.metadata['description']}")
 
     seq_info.worms_aphiaid = int(worms_record["AphiaID"])
     seq_info.worms_rank = worms_record["rank"]
     seq_info.worms_ismarine = bool(worms_record["isMarine"])
+    seq_info.worms_name = worms_record["scientificname"]
     seq_info.worms_valid_name = worms_record["valid_name"]
-    seq_info.worms_valid_genus = seq_info.worms_valid_name.split()[0]
+    seq_info.worms_valid_genus = (
+        seq_info.worms_valid_name.split()[0]
+        if seq_info.worms_valid_name and seq_info.worms_rank in ["Genus", "Species"]
+        else None
+    )
 
     return seq_info
+
+
+def load_worms_cache(path: Path) -> dict:
+    if path.exists():
+        with open(path, "rb") as f:
+            worms_cache = pickle.load(f)
+            print(f"Loaded WoRMS cache from disk with {len(worms_cache)} entries")
+            return worms_cache
+
+    return {}
+
+
+def save_worms_cache(worms_cache: dict, path: Path) -> None:
+    with open(path, "wb") as f:
+        pickle.dump(worms_cache, f)
 
 
 def main() -> None:
@@ -142,22 +161,28 @@ def main() -> None:
 
     # Intermediate structure for saving record data
     sequence_rows = []
-    worms_cache = {}
     alignment_length = 50000
+
+    # Try to load exsisting worms cache from disk
+    worms_cache = load_worms_cache(cfg.worms_cache)
 
     # Read each reference sequence, saving the sparse alignment representation
     seq: skbio.RNA
-    for seq in tqdm(
-        skbio.read(cfg.input_ref_fasta, format="fasta", constructor=skbio.RNA),
+    for count, seq in tqdm(
+        enumerate(skbio.read(cfg.input_ref_fasta, format="fasta", constructor=skbio.RNA)),
         desc="Processing reference sequences",
     ):
         sequence_rows.append(
             process_record(
                 seq=seq,
                 alignment_length=alignment_length,
+                seq_type="ref",
                 worms_cache=worms_cache,
             )
         )
+
+        if count % 1000 == 0:
+            save_worms_cache(worms_cache, cfg.worms_cache)
 
     # Now process the outgroup sequences
     seq: skbio.RNA
@@ -169,11 +194,12 @@ def main() -> None:
             process_record(
                 seq=seq,
                 alignment_length=alignment_length,
-                silva_header=True,
-                is_outgroup=True,
+                seq_type="outgroup",
                 worms_cache=worms_cache,
             )
         )
+
+    save_worms_cache(worms_cache, cfg.worms_cache)
 
     # Finally process the OTU sequences
     seq: skbio.RNA
@@ -182,11 +208,7 @@ def main() -> None:
         desc="Processing OTU sequences",
     ):
         sequence_rows.append(
-            process_record(
-                seq=seq,
-                alignment_length=alignment_length,
-                is_otu=True,
-            )
+            process_record(seq=seq, alignment_length=alignment_length, seq_type="otu")
         )
 
     # Save to a PyArrow backed Pandas Dataframe
@@ -243,6 +265,9 @@ def main() -> None:
 
     # Join both Dataframes and save to a compact Parquet file
     df = df_seq.join(df_uc)
+    df["clust_target_genus"] = df["clust_target"].map(df["worms_valid_genus"])
+    df["clust_genus_agree"] = df["worms_valid_genus"] == df["clust_target_genus"]
+
     df.to_parquet(cfg.output_parquet, engine="pyarrow", compression="snappy")
 
 

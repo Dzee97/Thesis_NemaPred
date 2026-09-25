@@ -14,6 +14,7 @@ from tqdm import tqdm
 @dataclass
 class Config:
     input_parquet: Path
+    input_trait_genera: Path
     output_fasta: Path
     output_outgroup: Path
     output_genus_cov: Path
@@ -21,6 +22,7 @@ class Config:
     no_contained: bool
     only_centroids: bool
     otu_coverage: float
+    max_ambiguity: float
     min_length: int
     dist_model: str
     model_gamma: float
@@ -111,15 +113,17 @@ def create_compressed_alignment(df: pd.DataFrame) -> list[skbio.RNA]:
 
 
 def update_genus_coverage(
-    df: pd.DataFrame, label: str, old_genus_cov: pd.DataFrame | None = None
+    df: pd.DataFrame, label: str, old_genus_cov: pd.DataFrame
 ) -> pd.DataFrame:
     genus_cov = df.groupby("worms_valid_genus").agg({"length": "count"})
     genus_cov.rename(columns={"length": label}, inplace=True)
 
-    if old_genus_cov is None:
-        return genus_cov
-
     return old_genus_cov.join(genus_cov).fillna(0)
+
+
+def region_coverage(msa_pos, start, end, region_length):
+    n_covered = np.sum((msa_pos >= start) & (msa_pos <= end))
+    return n_covered / region_length
 
 
 def main():
@@ -130,59 +134,99 @@ def main():
     df: pd.DataFrame = pa_table.to_pandas(types_mapper=pd.ArrowDtype, ignore_metadata=True)
     df.set_index("accession", inplace=True)
 
-    df_ref = df[(~df.is_outgroup) & (~df.is_otu)]
-    df_out = df[df.is_outgroup]
-    df_otu = df[df.is_otu]
+    df_ref = df[df.seq_type == "ref"]
+    df_out = df[df.seq_type == "outgroup"]
+    df_otu = df[df.seq_type == "otu"]
 
-    genus_cov = update_genus_coverage(df_ref, "start")
+    df_genera = pd.read_excel(cfg.input_trait_genera)
+    df_genera.set_index("Genus", inplace=True)
 
-    if cfg.no_duplicates:
-        df_ref = df_ref[~df_ref.clust_duplicate]
-    if cfg.no_contained:
-        df_ref = df_ref[~df_ref.clust_contained]
-    if cfg.only_centroids:
-        df_ref = df_ref[df_ref.clust_centroid]
+    df_ref = df_ref[df_ref.worms_valid_genus.isin(df_genera.index)]
 
-    genus_cov = update_genus_coverage(df_ref, "only centroids", genus_cov)
+    genus_cov = update_genus_coverage(df_ref, "Trait genera", df_genera)
+
+    df_ref = df_ref[df_ref.length >= cfg.min_length]
+
+    genus_cov = update_genus_coverage(df_ref, f"Only length >= {cfg.min_length}", genus_cov)
+
+    df_ref = df_ref[df_ref.ambiguity_frac <= cfg.max_ambiguity]
+
+    genus_cov = update_genus_coverage(df_ref, f"Max ambiguity <= {cfg.max_ambiguity}", genus_cov)
 
     otu_frame_start = df_otu.first_pos.median()
     otu_frame_end = df_otu.last_pos.median()
+    otu_length_median = df_otu.length.median()
 
-    df_ref["otu_coverage"] = np.maximum(
-        0,
-        np.minimum(otu_frame_end, df_ref.last_pos) - np.maximum(otu_frame_start, df_ref.first_pos),
-    ) / (otu_frame_end - otu_frame_start)
+    df_ref["otu_coverage"] = df_ref.msa_pos.apply(
+        lambda pos: region_coverage(pos, otu_frame_start, otu_frame_end, otu_length_median)
+    )
     df_ref = df_ref[df_ref.otu_coverage >= cfg.otu_coverage]
 
     genus_cov = update_genus_coverage(df_ref, f"OTU coverage >= {cfg.otu_coverage}", genus_cov)
 
+    df_ref = df_ref.sort_values(
+        ["worms_valid_genus", "clust_id", "otu_coverage", "length", "ambiguity_frac"],
+        ascending=[True, True, False, False, True],
+    )
+
+    df_ref = df_ref.groupby(["worms_valid_genus", "clust_id"], sort=False, group_keys=False).head(1)
+
+    genus_cov = update_genus_coverage(df_ref, "One per genus x cluster", genus_cov)
+
     msa = skbio.TabularMSA(create_compressed_alignment(df_ref))
     dist = align_dists(msa, metric=cfg.dist_model, gamma=cfg.model_gamma, shared_by_all=False)
+    dist_data = dist.data
+    np.fill_diagonal(dist_data, np.nan)
 
-    mean_dist = np.nanmedian(dist.data, axis=1)
-    z_scores = (mean_dist - mean_dist.mean()) / mean_dist.std()
+    median_dist = np.nanmedian(dist_data, axis=1)
+    z_scores = (median_dist - median_dist.mean()) / median_dist.std()
 
     print_phylo_z_distribution(z_scores, outlier_threshold=cfg.max_z_score)
 
     keep_indices = np.flatnonzero(z_scores <= cfg.max_z_score)
     df_ref = df_ref.iloc[keep_indices]
+    dist_data = dist_data[np.ix_(keep_indices, keep_indices)]
 
-    genus_cov = update_genus_coverage(df_ref, f"dist Z-score <= {cfg.max_z_score}", genus_cov)
+    genus_cov = update_genus_coverage(df_ref, f"Dist Z-score <= {cfg.max_z_score}", genus_cov)
 
-    dist = dist[np.ix_(keep_indices, keep_indices)]
-    k_closest = np.argpartition(dist, kth=cfg.k_closest + 1, axis=1)[:, 1 : cfg.k_closest + 1]
-    genera = df_ref.worms_valid_genus.to_numpy()
+    genera = df_ref.worms_vald_genus.to_numpy()
+    median_genus_dist = np.full(len(genera), np.nan)
 
-    _, inverse, counts = np.unique(genera, return_counts=True, return_inverse=True)
-    is_singleton = counts[inverse] == 1
+    for genus in np.unique(genera):
+        genus_idx = np.flatnonzero(genera == genus)
 
-    closest_genera = genera[k_closest]
-    own_genus = genera[:, None]
+        if len(genus_idx) == 1:
+            continue
 
-    matches_closest = np.any(closest_genera == own_genus, axis=1) | is_singleton
-    df_ref = df_ref.iloc[matches_closest]
+        genus_dist = dist_data[np.ix_(genus_idx, genus_idx)]
 
-    genus_cov = update_genus_coverage(df_ref, f"same genus in dist top {cfg.k_closest}", genus_cov)
+        median_genus_dist[genus_idx] = np.nanmedian(genus_dist, axis=1)
+
+    df_ref["median_genus_dist"] = median_genus_dist
+
+    df_ref = df_ref.sort_values(
+        ["worms_valid_genus", "median_genus_dist", "otu_coverage", "length", "ambiguity_frac"],
+        ascending=[True, True, False, False, True],
+    )
+
+    df_ref = df_ref.groupby("worms_valid_genus", sort=False, group_keys=False).head(3)
+
+    genus_cov = update_genus_coverage(df_ref, "Top 3 median genus dist", genus_cov)
+
+    # dist = dist[np.ix_(keep_indices, keep_indices)]
+    # k_closest = np.argpartition(dist, kth=cfg.k_closest + 1, axis=1)[:, 1 : cfg.k_closest + 1]
+    # genera = df_ref.worms_valid_genus.to_numpy()
+
+    # _, inverse, counts = np.unique(genera, return_counts=True, return_inverse=True)
+    # is_singleton = counts[inverse] == 1
+
+    # closest_genera = genera[k_closest]
+    # own_genus = genera[:, None]
+
+    # matches_closest = np.any(closest_genera == own_genus, axis=1) | is_singleton
+    # df_ref = df_ref.iloc[matches_closest]
+
+    # genus_cov = update_genus_coverage(df_ref, f"same genus in dist top {cfg.k_closest}", genus_cov)
 
     df_final = df.loc[df_ref.index.union(df_out.index)]
 
