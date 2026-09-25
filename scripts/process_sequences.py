@@ -38,8 +38,10 @@ class SequenceInfo:
     worms_rank: str | None = None
     worms_ismarine: bool | None = None
     worms_name: str | None = None
-    worms_valid_name: str | None = None
-    worms_valid_genus: str | None = None
+    worms_genus: str | None = None
+    worms_family: str | None = None
+    worms_order: str | None = None
+    worms_class: str | None = None
 
 
 def get_worms_taxonomy(queries: list[str], worms_cache: dict) -> dict[str, str] | None:
@@ -125,16 +127,21 @@ def process_record(
         return seq_info
         # raise RuntimeError(f"No WoRMS record found for: {seq.metadata['description']}")
 
+    if (
+        worms_record["valid_name"] is not None
+        and worms_record["scientificname"] != worms_record["valid_name"]
+    ):
+        new_worms_record = get_worms_taxonomy([worms_record["valid_name"]], worms_cache)
+        worms_record = new_worms_record if new_worms_record is not None else worms_record
+
     seq_info.worms_aphiaid = int(worms_record["AphiaID"])
     seq_info.worms_rank = worms_record["rank"]
     seq_info.worms_ismarine = bool(worms_record["isMarine"])
     seq_info.worms_name = worms_record["scientificname"]
-    seq_info.worms_valid_name = worms_record["valid_name"]
-    seq_info.worms_valid_genus = (
-        seq_info.worms_valid_name.split()[0]
-        if seq_info.worms_valid_name and seq_info.worms_rank in ["Genus", "Species"]
-        else None
-    )
+    seq_info.worms_genus = worms_record["genus"]
+    seq_info.worms_family = worms_record["family"]
+    seq_info.worms_order = worms_record["order"]
+    seq_info.worms_class = worms_record["class"]
 
     return seq_info
 
@@ -265,8 +272,6 @@ def main() -> None:
 
     # Join both Dataframes and save to a compact Parquet file
     df = df_seq.join(df_uc)
-    df["clust_target_genus"] = df["clust_target"].map(df["worms_valid_genus"])
-    df["clust_genus_agree"] = df["worms_valid_genus"] == df["clust_target_genus"]
 
     df.to_parquet(cfg.output_parquet, engine="pyarrow", compression="snappy")
 

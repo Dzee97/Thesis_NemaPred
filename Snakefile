@@ -124,7 +124,7 @@ rule filter_18s_sequences:
         "scripts/filter_sequences.py"
 
 
-rule create_18s_tree:
+rule create_18s_candidate_tree:
     input:
         input_fasta = PROCESSED_DATA_DIR / "Filtered_18S_aligned.fasta",
         input_outgroup = PROCESSED_DATA_DIR / "Filtered_18S_aligned.outgroup"
@@ -134,6 +134,31 @@ rule create_18s_tree:
         prefix_final = RAXML_DATA_DIR  / "Tree_18S"
     output:
         out_best_tree = RAXML_DATA_DIR / "Tree_18S.raxml.bestTree"
+    shell:
+        """
+        mkdir -p {params.raxml_dir}
+        raxml-ng --search --model {params.model} --msa {input.input_fasta} --prefix {params.prefix_final} --seed {SEED} --outgroup $(cat {input.input_outgroup})
+        """
+
+rule final_18s_sequences:
+    input:
+        input_parquet = PROCESSED_DATA_DIR / "Sequence_store.parquet",
+        input_tree = RAXML_DATA_DIR / "Tree_18S.raxml.bestTree"
+    output:
+        output_fasta = PROCESSED_DATA_DIR / "Final_18S_aligned.fasta"
+    script:
+        "scripts/final_sequences.py"
+
+rule create_18s_final_tree:
+    input:
+        input_fasta = PROCESSED_DATA_DIR / "Final_18S_aligned.fasta",
+        input_outgroup = PROCESSED_DATA_DIR / "Filtered_18S_aligned.outgroup"
+    params:
+        model = "GTR+G+I",
+        raxml_dir = RAXML_DATA_DIR,
+        prefix_final = RAXML_DATA_DIR  / "Final_tree_18S"
+    output:
+        out_best_tree = RAXML_DATA_DIR / "Final_tree_18S.raxml.bestTree"
     shell:
         """
         mkdir -p {params.raxml_dir}

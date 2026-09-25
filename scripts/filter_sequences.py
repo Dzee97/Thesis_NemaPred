@@ -8,7 +8,6 @@ import pyarrow.parquet as pq
 import skbio
 from skbio.alignment import align_dists
 from src.common import parse_config
-from tqdm import tqdm
 
 
 @dataclass
@@ -115,7 +114,7 @@ def create_compressed_alignment(df: pd.DataFrame) -> list[skbio.RNA]:
 def update_genus_coverage(
     df: pd.DataFrame, label: str, old_genus_cov: pd.DataFrame
 ) -> pd.DataFrame:
-    genus_cov = df.groupby("worms_valid_genus").agg({"length": "count"})
+    genus_cov = df.groupby("worms_genus").agg({"length": "count"})
     genus_cov.rename(columns={"length": label}, inplace=True)
 
     return old_genus_cov.join(genus_cov).fillna(0)
@@ -141,7 +140,7 @@ def main():
     df_genera = pd.read_excel(cfg.input_trait_genera)
     df_genera.set_index("Genus", inplace=True)
 
-    df_ref = df_ref[df_ref.worms_valid_genus.isin(df_genera.index)]
+    df_ref = df_ref[df_ref.worms_genus.isin(df_genera.index)]
 
     genus_cov = update_genus_coverage(df_ref, "Trait genera", df_genera)
 
@@ -165,11 +164,11 @@ def main():
     genus_cov = update_genus_coverage(df_ref, f"OTU coverage >= {cfg.otu_coverage}", genus_cov)
 
     df_ref = df_ref.sort_values(
-        ["worms_valid_genus", "clust_id", "length", "otu_coverage", "ambiguity_frac"],
+        ["worms_genus", "clust_id", "length", "otu_coverage", "ambiguity_frac"],
         ascending=[True, True, False, False, True],
     )
 
-    df_ref = df_ref.groupby(["worms_valid_genus", "clust_id"], sort=False, group_keys=False).head(1)
+    df_ref = df_ref.groupby(["worms_genus", "clust_id"], sort=False, group_keys=False).head(1)
 
     genus_cov = update_genus_coverage(df_ref, "One per genus x cluster", genus_cov)
 
@@ -189,7 +188,7 @@ def main():
 
     genus_cov = update_genus_coverage(df_ref, f"Dist Z-score <= {cfg.max_z_score}", genus_cov)
 
-    genera = df_ref.worms_valid_genus.to_numpy()
+    genera = df_ref.worms_genus.to_numpy()
     median_genus_dist = np.full(len(genera), np.nan)
 
     for genus in np.unique(genera):
@@ -204,44 +203,48 @@ def main():
 
     df_ref["median_genus_dist"] = median_genus_dist
 
+    other_genus_dist = dist_data.copy()
+    for i, genus in enumerate(genera):
+        same_genus = genera == genus
+        other_genus_dist[i, same_genus] = np.inf
+
+    nearest_other_idx = np.argmin(other_genus_dist, axis=1)
+
+    df_ref["nearest_other"] = df_ref.index[nearest_other_idx]
+    df_ref["nearest_other_family"] = df_ref.nearest_other.map(df_ref.worms_family)
+    df_ref["nearest_other_order"] = df_ref.nearest_other.map(df_ref.worms_order)
+
+    df_ref["nearest_other_family_match"] = df_ref.worms_family == df_ref.nearest_other_family
+    df_ref["nearest_other_order_match"] = df_ref.worms_order == df_ref.nearest_other_order
+
     df_ref = df_ref.sort_values(
-        ["worms_valid_genus", "median_genus_dist", "length", "otu_coverage", "ambiguity_frac"],
-        ascending=[True, True, False, False, True],
+        [
+            "worms_genus",
+            "nearest_other_order_match",
+            "nearest_other_family_match",
+            "length",
+            "otu_coverage",
+            "ambiguity_frac",
+        ],
+        ascending=[True, False, False, False, False, True],
     )
 
-    df_ref = df_ref.groupby("worms_valid_genus", sort=False, group_keys=False).head(3)
+    df_ref = df_ref.groupby("worms_genus", sort=False, group_keys=False).head(5)
 
-    genus_cov = update_genus_coverage(df_ref, "Top 3 median genus dist", genus_cov)
-
-    # dist = dist[np.ix_(keep_indices, keep_indices)]
-    # k_closest = np.argpartition(dist, kth=cfg.k_closest + 1, axis=1)[:, 1 : cfg.k_closest + 1]
-    # genera = df_ref.worms_valid_genus.to_numpy()
-
-    # _, inverse, counts = np.unique(genera, return_counts=True, return_inverse=True)
-    # is_singleton = counts[inverse] == 1
-
-    # closest_genera = genera[k_closest]
-    # own_genus = genera[:, None]
-
-    # matches_closest = np.any(closest_genera == own_genus, axis=1) | is_singleton
-    # df_ref = df_ref.iloc[matches_closest]
-
-    # genus_cov = update_genus_coverage(df_ref, f"same genus in dist top {cfg.k_closest}", genus_cov)
+    genus_cov = update_genus_coverage(df_ref, "Top 5 taxonomy consistency", genus_cov)
 
     df_final = df.loc[df_ref.index.union(df_out.index)]
 
     with open(cfg.output_fasta, "w") as f:
         f.writelines(
-            f">{accession}_{row.worms_valid_genus}\n{seq}\n"
+            f">{accession}_{row.worms_genus}\n{seq}\n"
             for (accession, row), seq in zip(
                 df_final.iterrows(), create_compressed_alignment(df_final)
             )
         )
 
     with open(cfg.output_outgroup, "w") as f:
-        f.write(
-            ",".join(f"{accession}_{row.worms_valid_genus}" for accession, row in df_out.iterrows())
-        )
+        f.write(",".join(f"{accession}_{row.worms_genus}" for accession, row in df_out.iterrows()))
 
     genus_cov.to_csv(cfg.output_genus_cov)
 
