@@ -109,7 +109,7 @@ rule filter_18s_sequences:
         no_duplicates = False,
         no_contained = False,
         only_centroids = True,
-        min_length = 300,
+        min_length = 400,
         max_ambiguity = 0.01,
         otu_coverage = 0.8,
         dist_model = "tn93",
@@ -137,16 +137,20 @@ rule create_18s_candidate_tree:
     shell:
         """
         mkdir -p {params.raxml_dir}
-        raxml-ng --search --model {params.model} --msa {input.input_fasta} --prefix {params.prefix_final} --seed {SEED} --outgroup $(cat {input.input_outgroup}) --tree pars{{25}},rand{{25}}
+        raxml-ng --search --model {params.model} --msa {input.input_fasta} --prefix {params.prefix_final} --seed {SEED} --outgroup $(cat {input.input_outgroup}) 
         """
 
 rule final_18s_sequences:
     input:
         input_parquet = PROCESSED_DATA_DIR / "Sequence_store.parquet",
-        input_tree = RAXML_DATA_DIR / "Tree_18S.raxml.bestTree"
+        input_tree = RAXML_DATA_DIR / "Tree_18S.raxml.bestTree",
+        input_trait_genera = RAW_DATA_DIR / "Project_data_Nematode_traits" / "MarNemaFunDiv_Genera.xlsx"
     output:
         output_fasta = PROCESSED_DATA_DIR / "Final_18S_aligned.fasta",
-        output_selection = PROCESSED_DATA_DIR / "Final_18S_selection.csv"
+        output_selection = PROCESSED_DATA_DIR / "Final_18S_selection.csv",
+        output_itol_class = PROCESSED_DATA_DIR / "Final_18S_class.annotation",
+        output_itol_order = PROCESSED_DATA_DIR / "Final_18S_order.annotation",
+        output_itol_family = PROCESSED_DATA_DIR / "Final_18S_family.annotation"
     script:
         "scripts/final_sequences.py"
 

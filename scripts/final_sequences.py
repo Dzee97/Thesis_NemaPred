@@ -1,3 +1,4 @@
+import colorsys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,9 +15,62 @@ from scripts.filter_sequences import create_compressed_alignment
 @dataclass
 class Config:
     input_parquet: Path
+    input_trait_genera: Path
     input_tree: Path
     output_fasta: Path
     output_selection: Path
+    output_itol_class: Path
+    output_itol_order: Path
+    output_itol_family: Path
+
+
+def write_itol_colorstrip(
+    df: pd.DataFrame,
+    taxon_col: str,
+    dataset_label: str,
+    output_path: Path,
+):
+    # Only taxa with an assigned value
+    taxa = sorted(df[taxon_col].dropna().unique())
+
+    # Generate one deterministic color per taxon
+    colors = {}
+
+    for i, taxon in enumerate(taxa):
+        hue = i / len(taxa)
+
+        r, g, b = colorsys.hsv_to_rgb(
+            hue,
+            0.65,
+            0.90,
+        )
+
+        colors[taxon] = f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
+
+    with open(output_path, "w") as f:
+        f.write("DATASET_COLORSTRIP\n")
+        f.write("SEPARATOR TAB\n")
+        f.write(f"DATASET_LABEL\t{dataset_label}\n")
+        f.write("COLOR\t#000000\n")
+
+        # Legend
+        if taxa:
+            f.write(f"LEGEND_TITLE\t{dataset_label}\n")
+            f.write("LEGEND_SHAPES\t" + "\t".join(["1"] * len(taxa)) + "\n")
+            f.write("LEGEND_COLORS\t" + "\t".join(colors[taxon] for taxon in taxa) + "\n")
+            f.write("LEGEND_LABELS\t" + "\t".join(str(taxon) for taxon in taxa) + "\n")
+
+        f.write("DATA\n")
+
+        for accession, row in df.iterrows():
+            taxon = row[taxon_col]
+
+            if pd.isna(taxon):
+                continue
+
+            tip_name = f"{accession}_{row.worms_genus}"
+
+            f.write(f"{tip_name}\t{colors[taxon]}\t{taxon}\n")
 
 
 def main():
@@ -43,6 +97,7 @@ def main():
 
     genera = df_ref.worms_genus.to_numpy()
     median_genus_dist = np.full(len(genera), np.nan)
+    best_genus_dist = np.full(len(genera), np.nan)
 
     for genus in np.unique(genera):
         genus_idx = np.flatnonzero(genera == genus)
@@ -51,49 +106,80 @@ def main():
             continue
 
         genus_dist = dist_data[np.ix_(genus_idx, genus_idx)]
+        median_dist = np.nanmedian(genus_dist, axis=1)
 
-        median_genus_dist[genus_idx] = np.nanmedian(genus_dist, axis=1)
+        median_genus_dist[genus_idx] = median_dist
+        best_genus_dist[genus_idx] = np.min(median_dist)
 
-    df_ref["median_genus_dist"] = median_genus_dist
+    _, genus_first_idx = np.unique(genera, return_index=True)
+    eps_values = best_genus_dist[genus_first_idx]
+    eps = np.nanquantile(eps_values, 0.2)
 
-    best_genus_dist = df_ref.groupby("worms_genus").median_genus_dist.transform("min")
-    eps = df_ref.median_genus_dist.quantile(0.1)
-    df_ref["central"] = df_ref.median_genus_dist.isna() | (
-        df_ref.median_genus_dist <= best_genus_dist + 0.5 * np.maximum(best_genus_dist, eps)
+    df_ref["central"] = np.isnan(median_genus_dist) | (
+        median_genus_dist <= best_genus_dist + 0.5 * np.maximum(best_genus_dist, eps)
     )
 
-    other_genus_dist = dist_data.copy()
+    keep_indices = np.flatnonzero(df_ref.central.to_numpy())
+    dist_data = dist_data[np.ix_(keep_indices, keep_indices)]
+    df_ref = df_ref[df_ref.central]
+
+    genera = df_ref.worms_genus.to_numpy()
+    families = df_ref.worms_family.to_numpy()
+    orders = df_ref.worms_order.to_numpy()
+
+    unique_genera = np.unique(genera)
+
+    family_fraction = np.full(len(df_ref), np.nan)
+    order_fraction = np.full(len(df_ref), np.nan)
+
     for i, genus in enumerate(genera):
-        same_genus = genera == genus
-        other_genus_dist[i, same_genus] = np.inf
+        other_genus_info = []
 
-    nearest_other_idx = np.argmin(other_genus_dist, axis=1)
+        for other_genus in unique_genera:
+            if other_genus == genus:
+                continue
 
-    df_ref["nearest_other"] = df_ref.index[nearest_other_idx]
-    df_ref["nearest_other_family"] = df_ref.nearest_other.map(df_ref.worms_family)
-    df_ref["nearest_other_order"] = df_ref.nearest_other.map(df_ref.worms_order)
+            genus_idx = np.flatnonzero(genera == other_genus)
 
-    df_ref["nearest_other_family_match"] = df_ref.worms_family == df_ref.nearest_other_family
-    df_ref["nearest_other_order_match"] = df_ref.worms_order == df_ref.nearest_other_order
+            local_idx = np.nanargmin(dist_data[i, genus_idx])
+            closest_tip_idx = genus_idx[local_idx]
 
-    family_testable = df_ref.groupby("worms_family").worms_genus.transform("nunique").gt(1)
-    order_testable = df_ref.groupby("worms_order").worms_genus.transform("nunique").gt(1)
+            min_dist = dist_data[i, closest_tip_idx]
 
-    df_ref.loc[~family_testable, "nearest_other_family_match"] = pd.NA
-    df_ref.loc[~order_testable, "nearest_other_order_match"] = pd.NA
+            other_genus_info.append((min_dist, other_genus, closest_tip_idx))
+
+        other_genus_info.sort(key=lambda x: x[0])
+        neighbors = other_genus_info[:5]
+
+        neighbor_idx = np.array([x[2] for x in neighbors])
+
+        other_family_exists = np.any((genera != genus) & (families == families[i]))
+        if other_family_exists:
+            family_fraction[i] = np.mean(families[neighbor_idx] == families[i])
+
+        other_order_exists = np.any((genera != genus) & (orders == orders[i]))
+        if other_order_exists:
+            order_fraction[i] = np.mean(orders[neighbor_idx] == orders[i])
+
+    df_ref["nearest_k_family_fraction"] = family_fraction
+    df_ref["nearest_k_order_fraction"] = order_fraction
+
+    df_genera = pd.read_excel(cfg.input_trait_genera)
+    df_genera.set_index("Genus", inplace=True)
+
+    df_ref = df_ref[df_ref.worms_genus.isin(df_genera.index)]
 
     selection_cols = [
         "worms_genus",
-        "central",
-        "nearest_other_order_match",
-        "nearest_other_family_match",
+        "nearest_k_order_fraction",
+        "nearest_k_family_fraction",
         "length",
         "ambiguity_frac",
     ]
 
     df_ref = df_ref.sort_values(
         selection_cols,
-        ascending=[True, False, False, False, False, True],
+        ascending=[True, False, False, False, True],
     )
 
     df_ref = df_ref.groupby("worms_genus", sort=False, group_keys=False).head(1)
@@ -109,6 +195,27 @@ def main():
                 df_final.iterrows(), create_compressed_alignment(df_final)
             )
         )
+
+    write_itol_colorstrip(
+        df_ref,
+        "worms_class",
+        "Class",
+        cfg.output_itol_class,
+    )
+
+    write_itol_colorstrip(
+        df_ref,
+        "worms_order",
+        "Order",
+        cfg.output_itol_order,
+    )
+
+    write_itol_colorstrip(
+        df_ref,
+        "worms_family",
+        "Family",
+        cfg.output_itol_family,
+    )
 
 
 if __name__ == "__main__":

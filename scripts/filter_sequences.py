@@ -111,13 +111,15 @@ def create_compressed_alignment(df: pd.DataFrame) -> list[skbio.RNA]:
     return aligned_sequences
 
 
-def update_genus_coverage(
-    df: pd.DataFrame, label: str, old_genus_cov: pd.DataFrame
-) -> pd.DataFrame:
-    genus_cov = df.groupby("worms_genus").agg({"length": "count"})
-    genus_cov.rename(columns={"length": label}, inplace=True)
+def update_genus_coverage(df: pd.DataFrame, label: str, genus_cov: pd.DataFrame) -> pd.DataFrame:
+    new_col = (
+        df.groupby(["worms_order", "worms_family", "worms_genus", "is_target"])
+        .size()
+        .astype("Int64")
+    )
+    genus_cov[label] = new_col
 
-    return old_genus_cov.join(genus_cov).fillna(0)
+    return genus_cov
 
 
 def region_coverage(msa_pos, start, end, region_length):
@@ -133,29 +135,44 @@ def main():
     df: pd.DataFrame = pa_table.to_pandas(types_mapper=pd.ArrowDtype, ignore_metadata=True)
     df.set_index("accession", inplace=True)
 
-    df_ref = df[df.seq_type == "ref"]
+    df_ref = df[df.seq_type == "ref"].copy()
     df_out = df[df.seq_type == "outgroup"]
     df_otu = df[df.seq_type == "otu"]
 
     df_genera = pd.read_excel(cfg.input_trait_genera)
     df_genera.set_index("Genus", inplace=True)
 
-    df_ref = df_ref[df_ref.worms_genus.isin(df_genera.index)]
+    # 1. Set genera that are in the trait dataset
+    df_ref["is_target"] = df_ref.worms_genus.isin(df_genera.index)
 
-    genus_cov = update_genus_coverage(df_ref, "Trait genera", df_genera)
+    # 2. Filter out all sequences that dont share an order with the trait genera and are not marine
+    df_ref = df_ref[
+        (~df_ref.worms_genus.isna())
+        & (df_ref.worms_ismarine)
+        & (df_ref.worms_order.isin(df_ref[df_ref.is_target].worms_order))
+    ]
 
+    genus_cov = (
+        df_ref.groupby(["worms_order", "worms_family", "worms_genus", "is_target"])
+        .size()
+        .to_frame(name="Start")
+    )
+
+    # 3. Filter out short sequences
     df_ref = df_ref[df_ref.length >= cfg.min_length]
 
-    genus_cov = update_genus_coverage(df_ref, f"Only length >= {cfg.min_length}", genus_cov)
+    genus_cov = update_genus_coverage(df_ref, f"Length >= {cfg.min_length}", genus_cov)
 
+    # 4. Filter out low quality sequences
     df_ref = df_ref[df_ref.ambiguity_frac <= cfg.max_ambiguity]
 
-    genus_cov = update_genus_coverage(df_ref, f"Max ambiguity <= {cfg.max_ambiguity}", genus_cov)
+    genus_cov = update_genus_coverage(df_ref, f"Ambiguity <= {cfg.max_ambiguity}", genus_cov)
 
     otu_frame_start = df_otu.first_pos.median()
     otu_frame_end = df_otu.last_pos.median()
     otu_length_median = df_otu.length.median()
 
+    # 5. Filter out sequences that dont span the OTU frame
     df_ref["otu_coverage"] = df_ref.msa_pos.apply(
         lambda pos: region_coverage(pos, otu_frame_start, otu_frame_end, otu_length_median)
     )
@@ -163,14 +180,14 @@ def main():
 
     genus_cov = update_genus_coverage(df_ref, f"OTU coverage >= {cfg.otu_coverage}", genus_cov)
 
+    # 6. Group by (genus, cluster) and keep only the longest sequence
     df_ref = df_ref.sort_values(
         ["worms_genus", "clust_id", "length", "otu_coverage", "ambiguity_frac"],
         ascending=[True, True, False, False, True],
     )
-
     df_ref = df_ref.groupby(["worms_genus", "clust_id"], sort=False, group_keys=False).head(1)
 
-    genus_cov = update_genus_coverage(df_ref, "One per genus x cluster", genus_cov)
+    genus_cov = update_genus_coverage(df_ref, "Genus x Cluster", genus_cov)
 
     msa = skbio.TabularMSA(create_compressed_alignment(df_ref))
     dist = align_dists(msa, metric=cfg.dist_model, gamma=cfg.model_gamma, shared_by_all=False)
@@ -182,6 +199,7 @@ def main():
 
     print_phylo_z_distribution(z_scores, outlier_threshold=cfg.max_z_score)
 
+    # 7. Filter out sequences that are extermely divergent to the other sequences
     keep_indices = np.flatnonzero(z_scores <= cfg.max_z_score)
     df_ref = df_ref.iloc[keep_indices]
     dist_data = dist_data[np.ix_(keep_indices, keep_indices)]
@@ -190,6 +208,7 @@ def main():
 
     genera = df_ref.worms_genus.to_numpy()
     median_genus_dist = np.full(len(genera), np.nan)
+    best_genus_dist = np.full(len(genera), np.nan)
 
     for genus in np.unique(genera):
         genus_idx = np.flatnonzero(genera == genus)
@@ -198,59 +217,33 @@ def main():
             continue
 
         genus_dist = dist_data[np.ix_(genus_idx, genus_idx)]
+        median_dist = np.nanmedian(genus_dist, axis=1)
 
-        median_genus_dist[genus_idx] = np.nanmedian(genus_dist, axis=1)
+        median_genus_dist[genus_idx] = median_dist
+        best_genus_dist[genus_idx] = np.min(median_dist)
 
-    df_ref["median_genus_dist"] = median_genus_dist
+    _, genus_first_idx = np.unique(genera, return_index=True)
+    eps_values = best_genus_dist[genus_first_idx]
+    eps = np.nanquantile(eps_values, 0.2)
 
-    # other_genus_dist = dist_data.copy()
-    # for i, genus in enumerate(genera):
-    #    same_genus = genera == genus
-    #    other_genus_dist[i, same_genus] = np.inf
-
-    # nearest_other_idx = np.argmin(other_genus_dist, axis=1)
-
-    # df_ref["nearest_other"] = df_ref.index[nearest_other_idx]
-    # df_ref["nearest_other_family"] = df_ref.nearest_other.map(df_ref.worms_family)
-    # df_ref["nearest_other_order"] = df_ref.nearest_other.map(df_ref.worms_order)
-
-    # df_ref["nearest_other_family_match"] = df_ref.worms_family == df_ref.nearest_other_family
-    # df_ref["nearest_other_order_match"] = df_ref.worms_order == df_ref.nearest_other_order
-
-    # df_ref = df_ref.sort_values(
-    #    [
-    #        "worms_genus",
-    #        "nearest_other_order_match",
-    #        "nearest_other_family_match",
-    #        "length",
-    #        "otu_coverage",
-    #        "ambiguity_frac",
-    #    ],
-    #    ascending=[True, False, False, False, False, True],
-    # )
-
-    # df_ref = df_ref.groupby("worms_genus", sort=False, group_keys=False).head(5)
-
-    # genus_cov = update_genus_coverage(df_ref, "Top 5 taxonomy consistency", genus_cov)
-
-    best_genus_dist = df_ref.groupby("worms_genus").median_genus_dist.transform("min")
-    eps = df_ref.median_genus_dist.quantile(0.1)
-    df_ref["central"] = df_ref.median_genus_dist.isna() | (
-        df_ref.median_genus_dist <= best_genus_dist + 0.5 * np.maximum(best_genus_dist, eps)
+    df_ref["central"] = np.isnan(median_genus_dist) | (
+        median_genus_dist <= best_genus_dist + 0.5 * np.maximum(best_genus_dist, eps)
     )
 
+    # 8. Filter out sequences that are more than 50% the lowest centrality score within each genus
     df_ref = df_ref[df_ref.central]
 
-    genus_cov = update_genus_coverage(df_ref, "Central within genus distances", genus_cov)
+    genus_cov = update_genus_coverage(df_ref, "Central w/i genus", genus_cov)
 
     df_ref = df_ref.sort_values(
         ["worms_genus", "length", "otu_coverage", "ambiguity_frac"],
         ascending=[True, False, False, True],
     )
 
-    df_ref = df_ref.groupby("worms_genus", sort=False, group_keys=False).head(5)
+    # 9. Keep up to 5 longest sequences per genus
+    df_ref = df_ref.groupby("worms_genus", sort=False, group_keys=False).head(3)
 
-    genus_cov = update_genus_coverage(df_ref, "Top 5 length", genus_cov)
+    genus_cov = update_genus_coverage(df_ref, "Top 3 length", genus_cov)
 
     df_final = df.loc[df_ref.index.union(df_out.index)]
 
