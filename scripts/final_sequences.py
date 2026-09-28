@@ -16,6 +16,7 @@ class Config:
     input_parquet: Path
     input_tree: Path
     output_fasta: Path
+    output_selection: Path
 
 
 def main():
@@ -55,6 +56,12 @@ def main():
 
     df_ref["median_genus_dist"] = median_genus_dist
 
+    best_genus_dist = df_ref.groupby("worms_genus").median_genus_dist.transform("min")
+    eps = df_ref.median_genus_dist.quantile(0.1)
+    df_ref["central"] = df_ref.median_genus_dist.isna() | (
+        df_ref.median_genus_dist <= best_genus_dist + 0.5 * np.maximum(best_genus_dist, eps)
+    )
+
     other_genus_dist = dist_data.copy()
     for i, genus in enumerate(genera):
         same_genus = genera == genus
@@ -69,19 +76,29 @@ def main():
     df_ref["nearest_other_family_match"] = df_ref.worms_family == df_ref.nearest_other_family
     df_ref["nearest_other_order_match"] = df_ref.worms_order == df_ref.nearest_other_order
 
+    family_testable = df_ref.groupby("worms_family").worms_genus.transform("nunique").gt(1)
+    order_testable = df_ref.groupby("worms_order").worms_genus.transform("nunique").gt(1)
+
+    df_ref.loc[~family_testable, "nearest_other_family_match"] = pd.NA
+    df_ref.loc[~order_testable, "nearest_other_order_match"] = pd.NA
+
+    selection_cols = [
+        "worms_genus",
+        "central",
+        "nearest_other_order_match",
+        "nearest_other_family_match",
+        "length",
+        "ambiguity_frac",
+    ]
+
     df_ref = df_ref.sort_values(
-        [
-            "worms_genus",
-            "nearest_other_order_match",
-            "nearest_other_family_match",
-            "median_genus_dist",
-            "length",
-            "ambiguity_frac",
-        ],
-        ascending=[True, False, False, True, False, True],
+        selection_cols,
+        ascending=[True, False, False, False, False, True],
     )
 
     df_ref = df_ref.groupby("worms_genus", sort=False, group_keys=False).head(1)
+
+    df_ref[selection_cols].to_csv(cfg.output_selection)
 
     df_final = df.loc[df_ref.index.union(df_out.index)]
 

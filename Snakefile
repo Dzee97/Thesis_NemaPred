@@ -137,7 +137,7 @@ rule create_18s_candidate_tree:
     shell:
         """
         mkdir -p {params.raxml_dir}
-        raxml-ng --search --model {params.model} --msa {input.input_fasta} --prefix {params.prefix_final} --seed {SEED} --outgroup $(cat {input.input_outgroup})
+        raxml-ng --search --model {params.model} --msa {input.input_fasta} --prefix {params.prefix_final} --seed {SEED} --outgroup $(cat {input.input_outgroup}) --tree pars{{25}},rand{{25}}
         """
 
 rule final_18s_sequences:
@@ -145,7 +145,8 @@ rule final_18s_sequences:
         input_parquet = PROCESSED_DATA_DIR / "Sequence_store.parquet",
         input_tree = RAXML_DATA_DIR / "Tree_18S.raxml.bestTree"
     output:
-        output_fasta = PROCESSED_DATA_DIR / "Final_18S_aligned.fasta"
+        output_fasta = PROCESSED_DATA_DIR / "Final_18S_aligned.fasta",
+        output_selection = PROCESSED_DATA_DIR / "Final_18S_selection.csv"
     script:
         "scripts/final_sequences.py"
 

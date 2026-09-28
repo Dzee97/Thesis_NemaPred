@@ -203,35 +203,54 @@ def main():
 
     df_ref["median_genus_dist"] = median_genus_dist
 
-    other_genus_dist = dist_data.copy()
-    for i, genus in enumerate(genera):
-        same_genus = genera == genus
-        other_genus_dist[i, same_genus] = np.inf
+    # other_genus_dist = dist_data.copy()
+    # for i, genus in enumerate(genera):
+    #    same_genus = genera == genus
+    #    other_genus_dist[i, same_genus] = np.inf
 
-    nearest_other_idx = np.argmin(other_genus_dist, axis=1)
+    # nearest_other_idx = np.argmin(other_genus_dist, axis=1)
 
-    df_ref["nearest_other"] = df_ref.index[nearest_other_idx]
-    df_ref["nearest_other_family"] = df_ref.nearest_other.map(df_ref.worms_family)
-    df_ref["nearest_other_order"] = df_ref.nearest_other.map(df_ref.worms_order)
+    # df_ref["nearest_other"] = df_ref.index[nearest_other_idx]
+    # df_ref["nearest_other_family"] = df_ref.nearest_other.map(df_ref.worms_family)
+    # df_ref["nearest_other_order"] = df_ref.nearest_other.map(df_ref.worms_order)
 
-    df_ref["nearest_other_family_match"] = df_ref.worms_family == df_ref.nearest_other_family
-    df_ref["nearest_other_order_match"] = df_ref.worms_order == df_ref.nearest_other_order
+    # df_ref["nearest_other_family_match"] = df_ref.worms_family == df_ref.nearest_other_family
+    # df_ref["nearest_other_order_match"] = df_ref.worms_order == df_ref.nearest_other_order
+
+    # df_ref = df_ref.sort_values(
+    #    [
+    #        "worms_genus",
+    #        "nearest_other_order_match",
+    #        "nearest_other_family_match",
+    #        "length",
+    #        "otu_coverage",
+    #        "ambiguity_frac",
+    #    ],
+    #    ascending=[True, False, False, False, False, True],
+    # )
+
+    # df_ref = df_ref.groupby("worms_genus", sort=False, group_keys=False).head(5)
+
+    # genus_cov = update_genus_coverage(df_ref, "Top 5 taxonomy consistency", genus_cov)
+
+    best_genus_dist = df_ref.groupby("worms_genus").median_genus_dist.transform("min")
+    eps = df_ref.median_genus_dist.quantile(0.1)
+    df_ref["central"] = df_ref.median_genus_dist.isna() | (
+        df_ref.median_genus_dist <= best_genus_dist + 0.5 * np.maximum(best_genus_dist, eps)
+    )
+
+    df_ref = df_ref[df_ref.central]
+
+    genus_cov = update_genus_coverage(df_ref, "Central within genus distances", genus_cov)
 
     df_ref = df_ref.sort_values(
-        [
-            "worms_genus",
-            "nearest_other_order_match",
-            "nearest_other_family_match",
-            "length",
-            "otu_coverage",
-            "ambiguity_frac",
-        ],
-        ascending=[True, False, False, False, False, True],
+        ["worms_genus", "length", "otu_coverage", "ambiguity_frac"],
+        ascending=[True, False, False, True],
     )
 
     df_ref = df_ref.groupby("worms_genus", sort=False, group_keys=False).head(5)
 
-    genus_cov = update_genus_coverage(df_ref, "Top 5 taxonomy consistency", genus_cov)
+    genus_cov = update_genus_coverage(df_ref, "Top 5 length", genus_cov)
 
     df_final = df.loc[df_ref.index.union(df_out.index)]
 
