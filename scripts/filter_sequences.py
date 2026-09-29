@@ -17,16 +17,15 @@ class Config:
     output_fasta: Path
     output_outgroup: Path
     output_genus_cov: Path
-    no_duplicates: bool
-    no_contained: bool
-    only_centroids: bool
-    otu_coverage: float
-    max_ambiguity: float
     min_length: int
+    max_ambiguity: float
+    otu_coverage: float
     dist_model: str
     model_gamma: float
     max_z_score: float
-    k_closest: int
+    eps_quantile: float
+    max_centrality: float
+    keep_longest: int
 
 
 def print_phylo_z_distribution(z_arr, outlier_threshold=2.5):
@@ -224,26 +223,28 @@ def main():
 
     _, genus_first_idx = np.unique(genera, return_index=True)
     eps_values = best_genus_dist[genus_first_idx]
-    eps = np.nanquantile(eps_values, 0.2)
+    eps = np.nanquantile(eps_values, cfg.eps_quantile)
 
     df_ref["central"] = np.isnan(median_genus_dist) | (
-        median_genus_dist <= best_genus_dist + 0.5 * np.maximum(best_genus_dist, eps)
+        median_genus_dist <= best_genus_dist + cfg.max_centrality * np.maximum(best_genus_dist, eps)
     )
 
     # 8. Filter out sequences that are more than 50% the lowest centrality score within each genus
     df_ref = df_ref[df_ref.central]
 
-    genus_cov = update_genus_coverage(df_ref, "Central w/i genus", genus_cov)
+    genus_cov = update_genus_coverage(
+        df_ref, f"Central <= {cfg.max_centrality} w/i genus", genus_cov
+    )
 
     df_ref = df_ref.sort_values(
         ["worms_genus", "length", "otu_coverage", "ambiguity_frac"],
         ascending=[True, False, False, True],
     )
 
-    # 9. Keep up to 5 longest sequences per genus
-    df_ref = df_ref.groupby("worms_genus", sort=False, group_keys=False).head(3)
+    # 9. Keep up to 3 longest sequences per genus
+    df_ref = df_ref.groupby("worms_genus", sort=False, group_keys=False).head(cfg.keep_longest)
 
-    genus_cov = update_genus_coverage(df_ref, "Top 3 length", genus_cov)
+    genus_cov = update_genus_coverage(df_ref, f"Top {cfg.keep_longest} length", genus_cov)
 
     df_final = df.loc[df_ref.index.union(df_out.index)]
 

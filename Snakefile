@@ -106,16 +106,15 @@ rule filter_18s_sequences:
         input_parquet = PROCESSED_DATA_DIR / "Sequence_store.parquet",
         input_trait_genera = RAW_DATA_DIR / "Project_data_Nematode_traits" / "MarNemaFunDiv_Genera.xlsx"
     params:
-        no_duplicates = False,
-        no_contained = False,
-        only_centroids = True,
         min_length = 400,
         max_ambiguity = 0.01,
         otu_coverage = 0.8,
         dist_model = "tn93",
         model_gamma = 0.4,
         max_z_score = 3,
-        k_closest = 20
+        eps_quantile = 0.1,
+        max_centrality = 0.5,
+        keep_longest = 3
     output:
         output_fasta = PROCESSED_DATA_DIR / "Filtered_18S_aligned.fasta",
         output_outgroup = PROCESSED_DATA_DIR / "Filtered_18S_aligned.outgroup",
@@ -145,19 +144,24 @@ rule final_18s_sequences:
         input_parquet = PROCESSED_DATA_DIR / "Sequence_store.parquet",
         input_tree = RAXML_DATA_DIR / "Tree_18S.raxml.bestTree",
         input_trait_genera = RAW_DATA_DIR / "Project_data_Nematode_traits" / "MarNemaFunDiv_Genera.xlsx"
+    params:
+        eps_quantile = 0.1,
+        max_centrality = 0.5,
+        num_genus_neighbors = 3
     output:
         output_fasta = PROCESSED_DATA_DIR / "Final_18S_aligned.fasta",
         output_selection = PROCESSED_DATA_DIR / "Final_18S_selection.csv",
+        output_outgroup = PROCESSED_DATA_DIR / "Final_18S_aligned.outgroup",
         output_itol_class = PROCESSED_DATA_DIR / "Final_18S_class.annotation",
         output_itol_order = PROCESSED_DATA_DIR / "Final_18S_order.annotation",
-        output_itol_family = PROCESSED_DATA_DIR / "Final_18S_family.annotation"
+        output_itol_family_dir = directory(PROCESSED_DATA_DIR / "Final_18S_family_annotation")
     script:
         "scripts/final_sequences.py"
 
 rule create_18s_final_tree:
     input:
         input_fasta = PROCESSED_DATA_DIR / "Final_18S_aligned.fasta",
-        input_outgroup = PROCESSED_DATA_DIR / "Filtered_18S_aligned.outgroup"
+        input_outgroup = PROCESSED_DATA_DIR / "Final_18S_aligned.outgroup"
     params:
         model = "GTR+G+I",
         raxml_dir = RAXML_DATA_DIR,
