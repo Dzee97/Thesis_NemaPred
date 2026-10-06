@@ -112,12 +112,9 @@ rule filter_18s_sequences:
         dist_model = "tn93",
         model_gamma = 0.4,
         max_z_score = 3,
-        eps_quantile = 0.1,
-        max_centrality = 0.5,
         min_length_frac = 0.8
     output:
         output_fasta = PROCESSED_DATA_DIR / "Filtered_18S_aligned.fasta",
-        output_outgroup = PROCESSED_DATA_DIR / "Filtered_18S_aligned.outgroup",
         output_genus_cov = PROCESSED_DATA_DIR / "Filtered_18s_genus_coverage.csv"
     script:
         "scripts/filter_sequences.py"
@@ -126,7 +123,6 @@ rule filter_18s_sequences:
 rule create_18s_candidate_tree:
     input:
         input_fasta = PROCESSED_DATA_DIR / "Filtered_18S_aligned.fasta",
-        input_outgroup = PROCESSED_DATA_DIR / "Filtered_18S_aligned.outgroup"
     params:
         model = "GTR+G+I",
         raxml_dir = RAXML_DATA_DIR,
@@ -136,7 +132,7 @@ rule create_18s_candidate_tree:
     shell:
         """
         mkdir -p {params.raxml_dir}
-        raxml-ng --search --model {params.model} --msa {input.input_fasta} --prefix {params.prefix_final} --seed {SEED} --outgroup $(cat {input.input_outgroup}) 
+        raxml-ng --search --model {params.model} --msa {input.input_fasta} --prefix {params.prefix_final} --seed {SEED} 
         """
 
 rule final_18s_sequences:
@@ -169,5 +165,5 @@ rule create_18s_final_tree:
     shell:
         """
         mkdir -p {params.raxml_dir}
-        raxml-ng --search --model {params.model} --msa {input.input_fasta} --prefix {params.prefix_final} --seed {SEED} --outgroup $(cat {input.input_outgroup}) --tree pars{{25}},rand{{25}}
+        raxml-ng --search --model {params.model} --msa {input.input_fasta} --prefix {params.prefix_final} --seed {SEED} --outgroup $(cat {input.input_outgroup}) --tree pars{{50}},rand{{50}}
         """

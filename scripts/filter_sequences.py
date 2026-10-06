@@ -9,7 +9,7 @@ import pyarrow.parquet as pq
 import skbio
 from scipy.cluster.hierarchy import dendrogram, fcluster, linkage
 from skbio.alignment import align_dists
-from sklearn.metrics import silhouette_score
+from sklearn.metrics import silhouette_samples
 from src.common import parse_config
 
 
@@ -18,7 +18,6 @@ class Config:
     input_parquet: Path
     input_trait_genera: Path
     output_fasta: Path
-    output_outgroup: Path
     output_genus_cov: Path
     min_length: int
     max_ambiguity: float
@@ -26,8 +25,6 @@ class Config:
     dist_model: str
     model_gamma: float
     max_z_score: float
-    eps_quantile: float
-    max_centrality: float
     min_length_frac: float
 
 
@@ -138,7 +135,6 @@ def main():
     df.set_index("accession", inplace=True)
 
     df_ref = df[df.seq_type == "ref"].copy()
-    df_out = df[df.seq_type == "outgroup"]
     df_otu = df[df.seq_type == "otu"]
 
     df_genera = pd.read_excel(cfg.input_trait_genera)
@@ -193,6 +189,7 @@ def main():
 
     msa = skbio.TabularMSA(create_compressed_alignment(df_ref), index=df_ref.index)
     dist = align_dists(msa, metric=cfg.dist_model, gamma=cfg.model_gamma, shared_by_all=False)
+    dist.data[dist.data < 0.0] = 0.0
 
     dist_data = dist.data.copy()
     np.fill_diagonal(dist_data, np.nan)
@@ -210,9 +207,9 @@ def main():
     genus_cov = update_genus_coverage(df_ref, f"Dist Z-score <= {cfg.max_z_score}", genus_cov)
 
     # 8. Perform hierarchical clustering on every genus
-
     genera = df_ref.worms_genus.to_numpy()
     genera_clusters = np.arange(len(genera), dtype=np.int16)
+    genera_silhouette_coefs = np.full(len(genera), np.nan)
     genera_linkages = {}
 
     for genus in np.unique(genera):
@@ -226,14 +223,15 @@ def main():
         genera_linkages[genus] = genus_linkage
 
         best_score = -1
-        best_k = 3
 
         for k in range(3, len(genus_idx)):
             labels = fcluster(genus_linkage, k, criterion="maxclust")
-            score = silhouette_score(genus_dist.data, labels, metric="precomputed")
+            coefs = silhouette_samples(genus_dist.data, labels, metric="precomputed")
+            score = np.asarray(coefs).mean()
 
             if score > best_score:
                 best_score = score
+                best_coefs = coefs
                 best_k = k
 
         optimal_labels = fcluster(genus_linkage, best_k, criterion="maxclust")
@@ -241,88 +239,40 @@ def main():
         print(f"Genus: {genus}, Size: {len(genus_idx)}, Optimal clusters: {best_k}")
 
         genera_clusters[genus_idx] = optimal_labels
+        genera_silhouette_coefs[genus_idx] = best_coefs
 
     df_ref["genus_cluster"] = genera_clusters
+    df_ref["genus_silhouette_coefs"] = genera_silhouette_coefs
+
+    df_ref["genus_long_enough"] = df_ref.length >= (
+        df_ref.groupby(["worms_genus", "genus_cluster"]).length.transform("max")
+        * cfg.min_length_frac
+    )
 
     df_ref = df_ref.sort_values(
-        ["worms_genus", "genus_cluster", "length", "otu_coverage", "ambiguity_frac"],
-        ascending=[True, True, False, False, True],
+        [
+            "worms_genus",
+            "genus_cluster",
+            "genus_long_enough",
+            "genus_silhouette_coefs",
+            "length",
+            "otu_coverage",
+            "ambiguity_frac",
+        ],
+        ascending=[True, True, False, False, False, False, True],
     )
 
     df_ref = df_ref.groupby(["worms_genus", "genus_cluster"], sort=False, group_keys=False).head(1)
 
-    genus_cov = update_genus_coverage(df_ref, "Longest per genus cluster", genus_cov)
+    genus_cov = update_genus_coverage(df_ref, "Genus cluster reps", genus_cov)
 
-    # genera = df_ref.worms_genus.to_numpy()
-    # median_genus_dist = np.full(len(genera), np.nan)
-    # best_genus_dist = np.full(len(genera), np.nan)
-
-    # for genus in np.unique(genera):
-    #    genus_idx = np.flatnonzero(genera == genus)
-
-    #    if len(genus_idx) == 1:
-    #        continue
-
-    #    genus_dist = dist_data[np.ix_(genus_idx, genus_idx)]
-    #    median_dist = np.nanmedian(genus_dist, axis=1)
-
-    #    median_genus_dist[genus_idx] = median_dist
-    #    best_genus_dist[genus_idx] = np.min(median_dist)
-
-    # _, genus_first_idx = np.unique(genera, return_index=True)
-    # eps_values = best_genus_dist[genus_first_idx]
-    # eps = np.nanquantile(eps_values, cfg.eps_quantile)
-
-    ## 8. Filter out sequences that are more than 50% the lowest centrality score within each genus
-    # df_ref["central"] = np.isnan(median_genus_dist) | (
-    #    median_genus_dist <= best_genus_dist + cfg.max_centrality * np.maximum(best_genus_dist, eps)
-    # )
-
-    # keep_indices = np.flatnonzero(df_ref.central.to_numpy())
-    # df_ref = df_ref.iloc[keep_indices]
-    # dist_data = dist_data[np.ix_(keep_indices, keep_indices)]
-
-    # genus_cov = update_genus_coverage(
-    #    df_ref, f"Central <= {cfg.max_centrality} w/i genus", genus_cov
-    # )
-
-    # 9. Keep sequences within 80% length of longest sequence within genus
-    # df_ref["long_enough"] = df_ref.length >= (
-    #    df_ref.groupby("worms_genus").length.transform("max") * cfg.min_length_frac
-    # )
-
-    # keep_indices = np.flatnonzero(df_ref.long_enough)
-    # df_ref = df_ref.iloc[keep_indices]
-    # dist_data = dist_data[np.ix_(keep_indices, keep_indices)]
-
-    # genus_cov = update_genus_coverage(
-    #    df_ref, f"Length >= {cfg.min_length_frac} max w/i genus", genus_cov
-    # )
-
-    # df_ref = df_ref.sort_values(
-    #    ["worms_genus", "length", "otu_coverage", "ambiguity_frac"],
-    #    ascending=[True, False, False, True],
-    # )
-
-    # 9. Keep up to 3 longest sequences per genus
-    # df_ref = df_ref.groupby("worms_genus", sort=False, group_keys=False).head(cfg.keep_longest)
-
-    # genus_cov = update_genus_coverage(df_ref, f"Top {cfg.keep_longest} length", genus_cov)
-
-    df_final = df.loc[df_ref.index.union(df_out.index)]
+    genus_cov.to_csv(cfg.output_genus_cov)
 
     with open(cfg.output_fasta, "w") as f:
         f.writelines(
             f">{accession}_{row.worms_genus}\n{seq}\n"
-            for (accession, row), seq in zip(
-                df_final.iterrows(), create_compressed_alignment(df_final)
-            )
+            for (accession, row), seq in zip(df_ref.iterrows(), create_compressed_alignment(df_ref))
         )
-
-    with open(cfg.output_outgroup, "w") as f:
-        f.write(",".join(f"{accession}_{row.worms_genus}" for accession, row in df_out.iterrows()))
-
-    genus_cov.to_csv(cfg.output_genus_cov)
 
 
 if __name__ == "__main__":

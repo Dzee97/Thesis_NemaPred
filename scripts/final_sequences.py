@@ -110,9 +110,10 @@ def main():
     tree_ids = [id.split()[0] for id in tree_dist.ids]
     tree_idx = {id: i for i, id in enumerate(tree_ids)}
 
-    df = df.loc[tree_ids]
-    df_ref = df[df.seq_type == "ref"].copy()
     df_out = df[df.seq_type == "outgroup"]
+    df_ref = df[df.seq_type == "ref"].copy()
+
+    df_ref = df_ref.loc[tree_ids]
 
     idx_map = np.array([tree_idx[accession] for accession in df_ref.index])
     dist_data = tree_dist.data[np.ix_(idx_map, idx_map)]
