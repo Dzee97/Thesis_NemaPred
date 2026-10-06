@@ -224,7 +224,7 @@ def main():
 
         best_score = -1
 
-        for k in range(3, len(genus_idx)):
+        for k in range(3, 4):
             labels = fcluster(genus_linkage, k, criterion="maxclust")
             coefs = silhouette_samples(genus_dist.data, labels, metric="precomputed")
             score = np.asarray(coefs).mean()
