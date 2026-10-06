@@ -145,7 +145,7 @@ rule final_18s_sequences:
         input_tree = RAXML_DATA_DIR / "Tree_18S.raxml.bestTree",
         input_trait_genera = RAW_DATA_DIR / "Project_data_Nematode_traits" / "MarNemaFunDiv_Genera.xlsx"
     params:
-        num_genus_neighbors = 5
+        num_genus_neighbors = 3
     output:
         output_fasta = PROCESSED_DATA_DIR / "Final_18S_aligned.fasta",
         output_selection = PROCESSED_DATA_DIR / "Final_18S_selection.csv",

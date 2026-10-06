@@ -1,12 +1,15 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import skbio
+from scipy.cluster.hierarchy import dendrogram, fcluster, linkage
 from skbio.alignment import align_dists
+from sklearn.metrics import silhouette_score
 from src.common import parse_config
 
 
@@ -188,9 +191,10 @@ def main():
 
     genus_cov = update_genus_coverage(df_ref, "Genus x Cluster", genus_cov)
 
-    msa = skbio.TabularMSA(create_compressed_alignment(df_ref))
+    msa = skbio.TabularMSA(create_compressed_alignment(df_ref), index=df_ref.index)
     dist = align_dists(msa, metric=cfg.dist_model, gamma=cfg.model_gamma, shared_by_all=False)
-    dist_data = dist.data
+
+    dist_data = dist.data.copy()
     np.fill_diagonal(dist_data, np.nan)
 
     median_dist = np.nanmedian(dist_data, axis=1)
@@ -201,55 +205,99 @@ def main():
     # 7. Filter out sequences that are extermely divergent to the other sequences
     keep_indices = np.flatnonzero(z_scores <= cfg.max_z_score)
     df_ref = df_ref.iloc[keep_indices]
-    dist_data = dist_data[np.ix_(keep_indices, keep_indices)]
+    dist = dist.filter(list(df_ref.index))
 
     genus_cov = update_genus_coverage(df_ref, f"Dist Z-score <= {cfg.max_z_score}", genus_cov)
 
+    # 8. Perform hierarchical clustering on every genus
+
     genera = df_ref.worms_genus.to_numpy()
-    median_genus_dist = np.full(len(genera), np.nan)
-    best_genus_dist = np.full(len(genera), np.nan)
+    genera_clusters = np.arange(len(genera), dtype=np.int16)
+    genera_linkages = {}
 
     for genus in np.unique(genera):
         genus_idx = np.flatnonzero(genera == genus)
 
-        if len(genus_idx) == 1:
+        if len(genus_idx) < 4:
             continue
 
-        genus_dist = dist_data[np.ix_(genus_idx, genus_idx)]
-        median_dist = np.nanmedian(genus_dist, axis=1)
+        genus_dist = dist.filter(list(df_ref.index[genus_idx]))
+        genus_linkage = linkage(genus_dist.condensed_form(), method="average")
+        genera_linkages[genus] = genus_linkage
 
-        median_genus_dist[genus_idx] = median_dist
-        best_genus_dist[genus_idx] = np.min(median_dist)
+        best_score = -1
+        best_k = 3
 
-    _, genus_first_idx = np.unique(genera, return_index=True)
-    eps_values = best_genus_dist[genus_first_idx]
-    eps = np.nanquantile(eps_values, cfg.eps_quantile)
+        for k in range(3, len(genus_idx)):
+            labels = fcluster(genus_linkage, k, criterion="maxclust")
+            score = silhouette_score(genus_dist.data, labels, metric="precomputed")
 
-    # 8. Filter out sequences that are more than 50% the lowest centrality score within each genus
-    df_ref["central"] = np.isnan(median_genus_dist) | (
-        median_genus_dist <= best_genus_dist + cfg.max_centrality * np.maximum(best_genus_dist, eps)
+            if score > best_score:
+                best_score = score
+                best_k = k
+
+        optimal_labels = fcluster(genus_linkage, best_k, criterion="maxclust")
+
+        print(f"Genus: {genus}, Size: {len(genus_idx)}, Optimal clusters: {best_k}")
+
+        genera_clusters[genus_idx] = optimal_labels
+
+    df_ref["genus_cluster"] = genera_clusters
+
+    df_ref = df_ref.sort_values(
+        ["worms_genus", "genus_cluster", "length", "otu_coverage", "ambiguity_frac"],
+        ascending=[True, True, False, False, True],
     )
 
-    keep_indices = np.flatnonzero(df_ref.central.to_numpy())
-    df_ref = df_ref.iloc[keep_indices]
-    dist_data = dist_data[np.ix_(keep_indices, keep_indices)]
+    df_ref = df_ref.groupby(["worms_genus", "genus_cluster"], sort=False, group_keys=False).head(1)
 
-    genus_cov = update_genus_coverage(
-        df_ref, f"Central <= {cfg.max_centrality} w/i genus", genus_cov
-    )
+    genus_cov = update_genus_coverage(df_ref, "Longest per genus cluster", genus_cov)
+
+    # genera = df_ref.worms_genus.to_numpy()
+    # median_genus_dist = np.full(len(genera), np.nan)
+    # best_genus_dist = np.full(len(genera), np.nan)
+
+    # for genus in np.unique(genera):
+    #    genus_idx = np.flatnonzero(genera == genus)
+
+    #    if len(genus_idx) == 1:
+    #        continue
+
+    #    genus_dist = dist_data[np.ix_(genus_idx, genus_idx)]
+    #    median_dist = np.nanmedian(genus_dist, axis=1)
+
+    #    median_genus_dist[genus_idx] = median_dist
+    #    best_genus_dist[genus_idx] = np.min(median_dist)
+
+    # _, genus_first_idx = np.unique(genera, return_index=True)
+    # eps_values = best_genus_dist[genus_first_idx]
+    # eps = np.nanquantile(eps_values, cfg.eps_quantile)
+
+    ## 8. Filter out sequences that are more than 50% the lowest centrality score within each genus
+    # df_ref["central"] = np.isnan(median_genus_dist) | (
+    #    median_genus_dist <= best_genus_dist + cfg.max_centrality * np.maximum(best_genus_dist, eps)
+    # )
+
+    # keep_indices = np.flatnonzero(df_ref.central.to_numpy())
+    # df_ref = df_ref.iloc[keep_indices]
+    # dist_data = dist_data[np.ix_(keep_indices, keep_indices)]
+
+    # genus_cov = update_genus_coverage(
+    #    df_ref, f"Central <= {cfg.max_centrality} w/i genus", genus_cov
+    # )
 
     # 9. Keep sequences within 80% length of longest sequence within genus
-    df_ref["long_enough"] = df_ref.length >= (
-        df_ref.groupby("worms_genus").length.transform("max") * cfg.min_length_frac
-    )
+    # df_ref["long_enough"] = df_ref.length >= (
+    #    df_ref.groupby("worms_genus").length.transform("max") * cfg.min_length_frac
+    # )
 
-    keep_indices = np.flatnonzero(df_ref.long_enough)
-    df_ref = df_ref.iloc[keep_indices]
-    dist_data = dist_data[np.ix_(keep_indices, keep_indices)]
+    # keep_indices = np.flatnonzero(df_ref.long_enough)
+    # df_ref = df_ref.iloc[keep_indices]
+    # dist_data = dist_data[np.ix_(keep_indices, keep_indices)]
 
-    genus_cov = update_genus_coverage(
-        df_ref, f"Length >= {cfg.min_length_frac} max w/i genus", genus_cov
-    )
+    # genus_cov = update_genus_coverage(
+    #    df_ref, f"Length >= {cfg.min_length_frac} max w/i genus", genus_cov
+    # )
 
     # df_ref = df_ref.sort_values(
     #    ["worms_genus", "length", "otu_coverage", "ambiguity_frac"],
