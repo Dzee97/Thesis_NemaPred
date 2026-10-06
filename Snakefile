@@ -114,7 +114,7 @@ rule filter_18s_sequences:
         max_z_score = 3,
         eps_quantile = 0.1,
         max_centrality = 0.5,
-        keep_longest = 3
+        min_length_frac = 0.8
     output:
         output_fasta = PROCESSED_DATA_DIR / "Filtered_18S_aligned.fasta",
         output_outgroup = PROCESSED_DATA_DIR / "Filtered_18S_aligned.outgroup",
@@ -145,9 +145,7 @@ rule final_18s_sequences:
         input_tree = RAXML_DATA_DIR / "Tree_18S.raxml.bestTree",
         input_trait_genera = RAW_DATA_DIR / "Project_data_Nematode_traits" / "MarNemaFunDiv_Genera.xlsx"
     params:
-        eps_quantile = 0.1,
-        max_centrality = 0.5,
-        num_genus_neighbors = 3
+        num_genus_neighbors = 5
     output:
         output_fasta = PROCESSED_DATA_DIR / "Final_18S_aligned.fasta",
         output_selection = PROCESSED_DATA_DIR / "Final_18S_selection.csv",

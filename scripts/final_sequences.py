@@ -25,8 +25,6 @@ class Config:
     output_itol_class: Path
     output_itol_order: Path
     output_itol_family_dir: Path
-    eps_quantile: float
-    max_centrality: float
     num_genus_neighbors: int
 
 
@@ -119,34 +117,6 @@ def main():
     idx_map = np.array([tree_idx[accession] for accession in df_ref.index])
     dist_data = tree_dist.data[np.ix_(idx_map, idx_map)]
     np.fill_diagonal(dist_data, np.nan)
-
-    # genera = df_ref.worms_genus.to_numpy()
-    # median_genus_dist = np.full(len(genera), np.nan)
-    # best_genus_dist = np.full(len(genera), np.nan)
-
-    # for genus in np.unique(genera):
-    #    genus_idx = np.flatnonzero(genera == genus)
-
-    #    if len(genus_idx) < 2:
-    #        continue
-
-    #    genus_dist = dist_data[np.ix_(genus_idx, genus_idx)]
-    #    median_dist = np.nanmedian(genus_dist, axis=1)
-
-    #    median_genus_dist[genus_idx] = median_dist
-    #    best_genus_dist[genus_idx] = np.min(median_dist)
-
-    # _, genus_first_idx = np.unique(genera, return_index=True)
-    # eps_values = best_genus_dist[genus_first_idx]
-    # eps = np.nanquantile(eps_values, cfg.eps_quantile)
-
-    # df_ref["central"] = np.isnan(median_genus_dist) | (
-    #    median_genus_dist <= best_genus_dist + cfg.max_centrality * np.maximum(best_genus_dist, eps)
-    # )
-
-    # keep_indices = np.flatnonzero(df_ref.central.to_numpy())
-    # dist_data = dist_data[np.ix_(keep_indices, keep_indices)]
-    # df_ref = df_ref[df_ref.central]
 
     genera = df_ref.worms_genus.to_numpy()
     unique_genera = np.unique(genera)
