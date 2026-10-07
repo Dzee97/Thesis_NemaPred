@@ -166,7 +166,7 @@ def main():
     genus_cov = pd.DataFrame(index=genus_cov_index)
     genus_cov.sort_index(level="traits_avail", ascending=False, sort_remaining=False, inplace=True)
 
-    genus_cov["Start"] = df_ref.groupby(genus_cov_index_cols).size().astype("Int64")
+    genus_cov["NCBI + SILVA"] = df_ref.groupby(genus_cov_index_cols).size().astype("Int64")
 
     # 3. Filter out short sequences
     df_ref = df_ref[df_ref.length >= cfg.min_length]
