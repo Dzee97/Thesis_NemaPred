@@ -110,15 +110,15 @@ def create_compressed_alignment(df: pd.DataFrame) -> list[skbio.RNA]:
     return aligned_sequences
 
 
-def update_genus_coverage(df: pd.DataFrame, label: str, genus_cov: pd.DataFrame) -> pd.DataFrame:
-    new_col = (
-        df.groupby(["worms_order", "worms_family", "worms_genus", "is_target"])
-        .size()
-        .astype("Int64")
-    )
-    genus_cov[label] = new_col
-
-    return genus_cov
+# def update_genus_coverage(df: pd.DataFrame, label: str, genus_cov: pd.DataFrame) -> pd.DataFrame:
+#    new_col = (
+#        df.groupby(["worms_order", "worms_family", "worms_genus", "is_target"])
+#        .size()
+#        .astype("Int64")
+#    )
+#    genus_cov[label] = new_col
+#
+#    return genus_cov
 
 
 def region_coverage(msa_pos, start, end, region_length):
@@ -137,34 +137,50 @@ def main():
     df_ref = df[df.seq_type == "ref"].copy()
     df_otu = df[df.seq_type == "otu"]
 
-    df_genera = pd.read_excel(cfg.input_trait_genera)
-    df_genera.set_index("Genus", inplace=True)
+    df_genera = pd.read_excel(
+        cfg.input_trait_genera,
+        names=["worms_class", "worms_order", "worms_family", "worms_genus"],
+    )
+    df_genera["traits_avail"] = True
 
     # 1. Set genera that are in the trait dataset
-    df_ref["is_target"] = df_ref.worms_genus.isin(df_genera.index)
+    df_ref["traits_avail"] = df_ref.worms_genus.isin(df_genera.worms_genus)
 
     # 2. Filter out all sequences that dont share an order with the trait genera and are not marine
     df_ref = df_ref[
         (~df_ref.worms_genus.isna())
         & (df_ref.worms_ismarine)
-        & (df_ref.worms_order.isin(df_ref[df_ref.is_target].worms_order))
+        & (df_ref.worms_order.isin(df_ref[df_ref.traits_avail].worms_order))
     ]
 
-    genus_cov = (
-        df_ref.groupby(["worms_order", "worms_family", "worms_genus", "is_target"])
-        .size()
-        .to_frame(name="Start")
+    genus_cov_index_cols = [
+        "worms_class",
+        "worms_order",
+        "worms_family",
+        "worms_genus",
+        "traits_avail",
+    ]
+    genus_cov_index = pd.MultiIndex.from_frame(df_genera[genus_cov_index_cols]).union(
+        pd.MultiIndex.from_frame(df_ref[genus_cov_index_cols].drop_duplicates())
     )
+    genus_cov = pd.DataFrame(index=genus_cov_index)
+    genus_cov.sort_index(level="traits_avail", ascending=False, sort_remaining=False, inplace=True)
+
+    genus_cov["Start"] = df_ref.groupby(genus_cov_index_cols).size().astype("Int64")
 
     # 3. Filter out short sequences
     df_ref = df_ref[df_ref.length >= cfg.min_length]
 
-    genus_cov = update_genus_coverage(df_ref, f"Length >= {cfg.min_length}", genus_cov)
+    genus_cov[f"Length >= {cfg.min_length}"] = (
+        df_ref.groupby(genus_cov_index_cols).size().astype("Int64")
+    )
 
     # 4. Filter out low quality sequences
     df_ref = df_ref[df_ref.ambiguity_frac <= cfg.max_ambiguity]
 
-    genus_cov = update_genus_coverage(df_ref, f"Ambiguity <= {cfg.max_ambiguity}", genus_cov)
+    genus_cov[f"Ambiguity <= {cfg.max_ambiguity}"] = (
+        df_ref.groupby(genus_cov_index_cols).size().astype("Int64")
+    )
 
     otu_frame_start = df_otu.first_pos.median()
     otu_frame_end = df_otu.last_pos.median()
@@ -176,7 +192,9 @@ def main():
     )
     df_ref = df_ref[df_ref.otu_coverage >= cfg.otu_coverage]
 
-    genus_cov = update_genus_coverage(df_ref, f"OTU coverage >= {cfg.otu_coverage}", genus_cov)
+    genus_cov[f"OTU coverage >= {cfg.otu_coverage}"] = (
+        df_ref.groupby(genus_cov_index_cols).size().astype("Int64")
+    )
 
     # 6. Group by (genus, cluster) and keep only the longest sequence
     df_ref = df_ref.sort_values(
@@ -185,7 +203,9 @@ def main():
     )
     df_ref = df_ref.groupby(["worms_genus", "clust_id"], sort=False, group_keys=False).head(1)
 
-    genus_cov = update_genus_coverage(df_ref, "Genus x Cluster", genus_cov)
+    genus_cov["Genus x global cluster"] = (
+        df_ref.groupby(genus_cov_index_cols).size().astype("Int64")
+    )
 
     msa = skbio.TabularMSA(create_compressed_alignment(df_ref), index=df_ref.index)
     dist = align_dists(msa, metric=cfg.dist_model, gamma=cfg.model_gamma, shared_by_all=False)
@@ -204,7 +224,9 @@ def main():
     df_ref = df_ref.iloc[keep_indices]
     dist = dist.filter(list(df_ref.index))
 
-    genus_cov = update_genus_coverage(df_ref, f"Dist Z-score <= {cfg.max_z_score}", genus_cov)
+    genus_cov[f"TN93 Z-score <= {cfg.max_z_score}"] = (
+        df_ref.groupby(genus_cov_index_cols).size().astype("Int64")
+    )
 
     # 8. Perform hierarchical clustering on every genus
     genera = df_ref.worms_genus.to_numpy()
@@ -264,7 +286,7 @@ def main():
 
     df_ref = df_ref.groupby(["worms_genus", "genus_cluster"], sort=False, group_keys=False).head(1)
 
-    genus_cov = update_genus_coverage(df_ref, "Genus cluster reps", genus_cov)
+    genus_cov["Genus cluster reps"] = df_ref.groupby(genus_cov_index_cols).size().astype("Int64")
 
     genus_cov.to_csv(cfg.output_genus_cov)
 
