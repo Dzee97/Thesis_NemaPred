@@ -1,4 +1,3 @@
-import colorsys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,7 +16,7 @@ from scripts.filter_sequences import create_compressed_alignment
 @dataclass
 class Config:
     input_parquet: Path
-    input_trait_genera: Path
+    input_trait_data: Path
     input_tree: Path
     output_fasta: Path
     output_selection: Path
@@ -104,32 +103,30 @@ def main():
     df: pd.DataFrame = pa_table.to_pandas(types_mapper=pd.ArrowDtype, ignore_metadata=True)
     df.set_index("accession", inplace=True)
 
+    df_ref = df[df.seq_type == "ref"].copy()
+    df_out = df[df.seq_type == "outgroup"]
+
     tree: skbio.TreeNode | Any
     tree = skbio.read(cfg.input_tree, format="newick", into=skbio.TreeNode)
     tree_dist = tree.cophenet()
-    tree_ids = [id.split()[0] for id in tree_dist.ids]
-    tree_idx = {id: i for i, id in enumerate(tree_ids)}
+    tree_dist_data = tree_dist.data.copy()
+    np.fill_diagonal(tree_dist_data, np.nan)
 
-    df_out = df[df.seq_type == "outgroup"]
-    df_ref = df[df.seq_type == "ref"].copy()
-
-    df_ref = df_ref.loc[tree_ids]
-
-    idx_map = np.array([tree_idx[accession] for accession in df_ref.index])
-    dist_data = tree_dist.data[np.ix_(idx_map, idx_map)]
-    np.fill_diagonal(dist_data, np.nan)
+    df_ref = df_ref.loc[[id.split()[0] for id in tree_dist.ids]]
 
     genera = df_ref.worms_genus.to_numpy()
     unique_genera = np.unique(genera)
 
     family_fraction = np.full(len(df_ref), np.nan)
     order_fraction = np.full(len(df_ref), np.nan)
+    class_fraction = np.full(len(df_ref), np.nan)
 
     taxonomy_lookup = df_ref.drop_duplicates("worms_genus").set_index("worms_genus")[
-        ["worms_family", "worms_order"]
+        ["worms_family", "worms_order", "worms_class"]
     ]
     family_count = taxonomy_lookup.groupby("worms_family").size()
     order_count = taxonomy_lookup.groupby("worms_order").size()
+    class_count = taxonomy_lookup.groupby("worms_class").size()
 
     for i, genus in enumerate(genera):
         other_genus_info = []
@@ -139,7 +136,7 @@ def main():
                 continue
 
             other_genus_idx = np.flatnonzero(genera == other_genus)
-            other_genus_dist = np.nanmedian(dist_data[i, other_genus_idx])
+            other_genus_dist = np.nanmedian(tree_dist_data[i, other_genus_idx])
             other_genus_info.append((other_genus_dist, other_genus))
 
         other_genus_info.sort(key=lambda x: x[0])
@@ -158,25 +155,34 @@ def main():
         if order_count[genus_order] > 1:
             order_fraction[i] = (neighbor_taxonomy.worms_order == genus_order).mean()
 
+        genus_class = genus_taxonomy.worms_class
+        if class_count[genus_class] > 1:
+            class_fraction[i] = (neighbor_taxonomy.worms_class == genus_class).mean()
+
     df_ref["nearest_k_family_fraction"] = family_fraction
     df_ref["nearest_k_order_fraction"] = order_fraction
+    df_ref["nearest_k_class_fraction"] = class_fraction
 
-    df_genera = pd.read_excel(cfg.input_trait_genera)
-    df_genera.set_index("Genus", inplace=True)
+    df_trait_data = pd.read_csv(cfg.input_trait_data, usecols=["worms_genus"])
 
-    df_ref = df_ref[df_ref.worms_genus.isin(df_genera.index)]
+    df_ref = df_ref[df_ref.worms_genus.isin(df_trait_data.worms_genus)]
 
     selection_cols = [
+        "worms_class",
+        "worms_order",
+        "worms_family",
         "worms_genus",
-        "nearest_k_order_fraction",
         "nearest_k_family_fraction",
+        "nearest_k_order_fraction",
+        "nearest_k_class_fraction",
         "length",
+        "otu_coverage",
         "ambiguity_frac",
     ]
 
     df_ref = df_ref.sort_values(
         selection_cols,
-        ascending=[True, False, False, False, True],
+        ascending=[True, True, True, True, False, False, False, False, False, True],
     )
 
     df_ref = df_ref.groupby("worms_genus", sort=False, group_keys=False).head(1)

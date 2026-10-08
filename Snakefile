@@ -44,20 +44,11 @@ rule create_outgroup_18s_fasta:
     script:
         "scripts/preprocess_silva.py"
 
-rule create_bold_18s_fasta:
-    input:
-        input_tsv = RAW_DATA_DIR / "BOLD" / "BOLD_Nematodes.tsv"
-    output:
-        output_fasta = PROCESSED_DATA_DIR / "BOLD_18s.fasta"
-    script:
-        "scripts/preprocess_bold.py"
-
 
 rule create_and_cluster_ref_18s_fasta:
     input:
         input_ncbi_fasta = PROCESSED_DATA_DIR / "NCBI_18S.fasta",
         input_silva_fasta = PROCESSED_DATA_DIR / "SILVA_18S.fasta"
-        #input_bold_fasta = PROCESSED_DATA_DIR / "BOLD_18s.fasta"
     params:
         id = 0.99
     output:
@@ -101,17 +92,29 @@ rule process_18s_alignments:
     script:
         "scripts/process_sequences.py"
 
+rule process_trait_data:
+    input:
+        input_trait_genera = RAW_DATA_DIR / "Project_data_Nematode_traits" / "MarNemaFunDiv_Genera.xlsx",
+        input_trait_data = RAW_DATA_DIR / "Project_data_Nematode_traits" / "MarNemaFunDiv_nematodes_traits (1).xlsx",
+    params:
+        worms_cache = PROCESSED_DATA_DIR / "WoRMS_cache.pkl"
+    output:
+        output_trait_data = PROCESSED_DATA_DIR / "Trait_data.csv"
+    script:
+        "scripts/process_traits.py"
+
 rule filter_18s_sequences:
     input:
         input_parquet = PROCESSED_DATA_DIR / "Sequence_store.parquet",
-        input_trait_genera = RAW_DATA_DIR / "Project_data_Nematode_traits" / "MarNemaFunDiv_Genera.xlsx"
+        input_trait_data = PROCESSED_DATA_DIR / "Trait_data.csv"
     params:
         min_length = 400,
         max_ambiguity = 0.01,
-        otu_coverage = 0.8,
+        otu_coverage = 0.7,
         dist_model = "tn93",
         model_gamma = 0.4,
         max_z_score = 3,
+        genus_clusters = 3,
         min_length_frac = 0.8
     output:
         output_fasta = PROCESSED_DATA_DIR / "Filtered_18S_aligned.fasta",
@@ -139,9 +142,9 @@ rule final_18s_sequences:
     input:
         input_parquet = PROCESSED_DATA_DIR / "Sequence_store.parquet",
         input_tree = RAXML_DATA_DIR / "Tree_18S.raxml.bestTree",
-        input_trait_genera = RAW_DATA_DIR / "Project_data_Nematode_traits" / "MarNemaFunDiv_Genera.xlsx"
+        input_trait_data = PROCESSED_DATA_DIR / "Trait_data.csv"
     params:
-        num_genus_neighbors = 3
+        num_genus_neighbors = 5
     output:
         output_fasta = PROCESSED_DATA_DIR / "Final_18S_aligned.fasta",
         output_selection = PROCESSED_DATA_DIR / "Final_18S_selection.csv",
@@ -159,11 +162,13 @@ rule create_18s_final_tree:
     params:
         model = "GTR+G+I",
         raxml_dir = RAXML_DATA_DIR,
-        prefix_final = RAXML_DATA_DIR  / "Final_tree_18S"
+        prefix_final = RAXML_DATA_DIR  / "Final_tree_18S",
+        pars_trees = 50,
+        rand_trees = 50
     output:
         out_best_tree = RAXML_DATA_DIR / "Final_tree_18S.raxml.bestTree"
     shell:
         """
         mkdir -p {params.raxml_dir}
-        raxml-ng --search --model {params.model} --msa {input.input_fasta} --prefix {params.prefix_final} --seed {SEED} --outgroup $(cat {input.input_outgroup}) --tree pars{{50}},rand{{50}}
+        raxml-ng --search --model {params.model} --msa {input.input_fasta} --prefix {params.prefix_final} --seed {SEED} --outgroup $(cat {input.input_outgroup}) --tree pars{{{params.pars_trees}}},rand{{{params.rand_trees}}}
         """

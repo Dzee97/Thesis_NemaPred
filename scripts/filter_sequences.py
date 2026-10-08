@@ -1,13 +1,13 @@
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import skbio
-from scipy.cluster.hierarchy import dendrogram, fcluster, linkage
+from scipy.cluster.hierarchy import fcluster, linkage
 from skbio.alignment import align_dists
 from sklearn.metrics import silhouette_samples
 from src.common import parse_config
@@ -16,7 +16,7 @@ from src.common import parse_config
 @dataclass
 class Config:
     input_parquet: Path
-    input_trait_genera: Path
+    input_trait_data: Path
     output_fasta: Path
     output_genus_cov: Path
     min_length: int
@@ -25,6 +25,7 @@ class Config:
     dist_model: str
     model_gamma: float
     max_z_score: float
+    genus_clusters: int
     min_length_frac: float
 
 
@@ -110,22 +111,6 @@ def create_compressed_alignment(df: pd.DataFrame) -> list[skbio.RNA]:
     return aligned_sequences
 
 
-# def update_genus_coverage(df: pd.DataFrame, label: str, genus_cov: pd.DataFrame) -> pd.DataFrame:
-#    new_col = (
-#        df.groupby(["worms_order", "worms_family", "worms_genus", "is_target"])
-#        .size()
-#        .astype("Int64")
-#    )
-#    genus_cov[label] = new_col
-#
-#    return genus_cov
-
-
-def region_coverage(msa_pos, start, end, region_length):
-    n_covered = np.sum((msa_pos >= start) & (msa_pos <= end))
-    return n_covered / region_length
-
-
 def main():
     snakemake = globals().get("snakemake", None)
     cfg = parse_config(Config, snakemake)
@@ -135,65 +120,54 @@ def main():
     df.set_index("accession", inplace=True)
 
     df_ref = df[df.seq_type == "ref"].copy()
-    df_otu = df[df.seq_type == "otu"]
 
-    df_genera = pd.read_excel(
-        cfg.input_trait_genera,
-        names=["worms_class", "worms_order", "worms_family", "worms_genus"],
+    taxonomy_cols = ["worms_class", "worms_order", "worms_family", "worms_genus"]
+
+    df_trait_genera = pd.read_csv(
+        cfg.input_trait_data,
+        usecols=taxonomy_cols,
     )
-    df_genera["traits_avail"] = True
 
-    # 1. Set genera that are in the trait dataset
-    df_ref["traits_avail"] = df_ref.worms_genus.isin(df_genera.worms_genus)
-
-    # 2. Filter out all sequences that dont share an order with the trait genera and are not marine
+    # 1. Filter out all sequences that dont share an order with the trait genera and are not marine
     df_ref = df_ref[
         (~df_ref.worms_genus.isna())
         & (df_ref.worms_ismarine)
-        & (df_ref.worms_order.isin(df_ref[df_ref.traits_avail].worms_order))
+        & (df_ref.worms_order.isin(df_trait_genera.worms_order))
     ]
 
-    genus_cov_index_cols = [
-        "worms_class",
-        "worms_order",
-        "worms_family",
-        "worms_genus",
-        "traits_avail",
-    ]
-    genus_cov_index = pd.MultiIndex.from_frame(df_genera[genus_cov_index_cols]).union(
-        pd.MultiIndex.from_frame(df_ref[genus_cov_index_cols].drop_duplicates())
+    genus_cov_index = pd.MultiIndex.from_frame(df_trait_genera).union(
+        pd.MultiIndex.from_frame(df_ref[taxonomy_cols].drop_duplicates())
     )
     genus_cov = pd.DataFrame(index=genus_cov_index)
-    genus_cov.sort_index(level="traits_avail", ascending=False, sort_remaining=False, inplace=True)
+    genus_cov["traits_avail"] = genus_cov.index.get_level_values("worms_genus").isin(
+        df_trait_genera.worms_genus
+    )
 
-    genus_cov["NCBI + SILVA"] = df_ref.groupby(genus_cov_index_cols).size().astype("Int64")
+    genus_cov.sort_values(
+        by=["traits_avail"] + taxonomy_cols,
+        ascending=[False] + [True for t in taxonomy_cols],
+        inplace=True,
+    )
+
+    genus_cov["NCBI + SILVA"] = df_ref.groupby(taxonomy_cols).size().astype("Int64")
 
     # 3. Filter out short sequences
     df_ref = df_ref[df_ref.length >= cfg.min_length]
 
-    genus_cov[f"Length >= {cfg.min_length}"] = (
-        df_ref.groupby(genus_cov_index_cols).size().astype("Int64")
-    )
+    genus_cov[f"Length >= {cfg.min_length}"] = df_ref.groupby(taxonomy_cols).size().astype("Int64")
 
     # 4. Filter out low quality sequences
     df_ref = df_ref[df_ref.ambiguity_frac <= cfg.max_ambiguity]
 
     genus_cov[f"Ambiguity <= {cfg.max_ambiguity}"] = (
-        df_ref.groupby(genus_cov_index_cols).size().astype("Int64")
+        df_ref.groupby(taxonomy_cols).size().astype("Int64")
     )
-
-    otu_frame_start = df_otu.first_pos.median()
-    otu_frame_end = df_otu.last_pos.median()
-    otu_length_median = df_otu.length.median()
 
     # 5. Filter out sequences that dont span the OTU frame
-    df_ref["otu_coverage"] = df_ref.msa_pos.apply(
-        lambda pos: region_coverage(pos, otu_frame_start, otu_frame_end, otu_length_median)
-    )
     df_ref = df_ref[df_ref.otu_coverage >= cfg.otu_coverage]
 
     genus_cov[f"OTU coverage >= {cfg.otu_coverage}"] = (
-        df_ref.groupby(genus_cov_index_cols).size().astype("Int64")
+        df_ref.groupby(taxonomy_cols).size().astype("Int64")
     )
 
     # 6. Group by (genus, cluster) and keep only the longest sequence
@@ -203,9 +177,7 @@ def main():
     )
     df_ref = df_ref.groupby(["worms_genus", "clust_id"], sort=False, group_keys=False).head(1)
 
-    genus_cov["Genus x global cluster"] = (
-        df_ref.groupby(genus_cov_index_cols).size().astype("Int64")
-    )
+    genus_cov["Genus x global cluster"] = df_ref.groupby(taxonomy_cols).size().astype("Int64")
 
     msa = skbio.TabularMSA(create_compressed_alignment(df_ref), index=df_ref.index)
     dist = align_dists(msa, metric=cfg.dist_model, gamma=cfg.model_gamma, shared_by_all=False)
@@ -217,15 +189,15 @@ def main():
     median_dist = np.nanmedian(dist_data, axis=1)
     z_scores = (median_dist - median_dist.mean()) / median_dist.std()
 
-    print_phylo_z_distribution(z_scores, outlier_threshold=cfg.max_z_score)
+    # print_phylo_z_distribution(z_scores, outlier_threshold=cfg.max_z_score)
 
     # 7. Filter out sequences that are extermely divergent to the other sequences
     keep_indices = np.flatnonzero(z_scores <= cfg.max_z_score)
     df_ref = df_ref.iloc[keep_indices]
-    dist = dist.filter(list(df_ref.index))
+    dist = cast(skbio.DistanceMatrix, dist.filter(list(df_ref.index)))
 
     genus_cov[f"TN93 Z-score <= {cfg.max_z_score}"] = (
-        df_ref.groupby(genus_cov_index_cols).size().astype("Int64")
+        df_ref.groupby(taxonomy_cols).size().astype("Int64")
     )
 
     # 8. Perform hierarchical clustering on every genus
@@ -240,28 +212,15 @@ def main():
         if len(genus_idx) < 4:
             continue
 
-        genus_dist = dist.filter(list(df_ref.index[genus_idx]))
+        genus_dist = cast(skbio.DistanceMatrix, dist.filter(list(df_ref.index[genus_idx])))
         genus_linkage = linkage(genus_dist.condensed_form(), method="average")
         genera_linkages[genus] = genus_linkage
 
-        best_score = -1
+        labels = fcluster(genus_linkage, cfg.genus_clusters, criterion="maxclust")
+        coefs = silhouette_samples(genus_dist.data, labels, metric="precomputed")
 
-        for k in range(3, 4):
-            labels = fcluster(genus_linkage, k, criterion="maxclust")
-            coefs = silhouette_samples(genus_dist.data, labels, metric="precomputed")
-            score = np.asarray(coefs).mean()
-
-            if score > best_score:
-                best_score = score
-                best_coefs = coefs
-                best_k = k
-
-        optimal_labels = fcluster(genus_linkage, best_k, criterion="maxclust")
-
-        print(f"Genus: {genus}, Size: {len(genus_idx)}, Optimal clusters: {best_k}")
-
-        genera_clusters[genus_idx] = optimal_labels
-        genera_silhouette_coefs[genus_idx] = best_coefs
+        genera_clusters[genus_idx] = labels
+        genera_silhouette_coefs[genus_idx] = coefs
 
     df_ref["genus_cluster"] = genera_clusters
     df_ref["genus_silhouette_coefs"] = genera_silhouette_coefs
@@ -286,7 +245,7 @@ def main():
 
     df_ref = df_ref.groupby(["worms_genus", "genus_cluster"], sort=False, group_keys=False).head(1)
 
-    genus_cov["Genus cluster reps"] = df_ref.groupby(genus_cov_index_cols).size().astype("Int64")
+    genus_cov["Genus cluster reps"] = df_ref.groupby(taxonomy_cols).size().astype("Int64")
 
     genus_cov.to_csv(cfg.output_genus_cov)
 

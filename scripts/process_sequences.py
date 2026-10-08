@@ -125,7 +125,6 @@ def process_record(
     worms_record = get_worms_taxonomy(worms_queries, worms_cache)
     if worms_record is None:
         return seq_info
-        # raise RuntimeError(f"No WoRMS record found for: {seq.metadata['description']}")
 
     if (
         worms_record["valid_name"] is not None
@@ -159,6 +158,11 @@ def load_worms_cache(path: Path) -> dict:
 def save_worms_cache(worms_cache: dict, path: Path) -> None:
     with open(path, "wb") as f:
         pickle.dump(worms_cache, f)
+
+
+def region_coverage(msa_pos, start, end, length):
+    n_covered = np.sum((msa_pos >= start) & (msa_pos <= end))
+    return n_covered / length
 
 
 def main() -> None:
@@ -223,6 +227,16 @@ def main() -> None:
     df_seq: pd.DataFrame = pa_table.to_pandas(types_mapper=pd.ArrowDtype)
 
     df_seq.set_index("accession", inplace=True)
+
+    # Calculate the OTU coverage of each sequence
+    df_otu = df_seq[df_seq.seq_type == "otu"]
+    otu_frame_start = df_otu.first_pos.median()
+    otu_frame_end = df_otu.last_pos.median()
+    otu_length = df_otu.length.median()
+
+    df_seq["otu_coverage"] = df_seq.msa_pos.apply(
+        lambda pos: region_coverage(pos, otu_frame_start, otu_frame_end, otu_length)
+    )
 
     # Load the VSEARCH clustering results in a PyArrow backed Pandas Dataframe
     print("Merging VSEARCH clustering results")
