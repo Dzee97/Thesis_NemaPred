@@ -114,6 +114,7 @@ def main():
 
     df_ref = df_ref.loc[[id.split()[0] for id in tree_dist.ids]]
 
+    species = df_ref.worms_name.to_numpy()
     genera = df_ref.worms_genus.to_numpy()
     unique_genera = np.unique(genera)
 
@@ -128,11 +129,11 @@ def main():
     order_count = taxonomy_lookup.groupby("worms_order").size()
     class_count = taxonomy_lookup.groupby("worms_class").size()
 
-    for i, genus in enumerate(genera):
+    for i, sp in enumerate(species):
         other_genus_info = []
 
         for other_genus in unique_genera:
-            if other_genus == genus:
+            if other_genus == genera[i]:
                 continue
 
             other_genus_idx = np.flatnonzero(genera == other_genus)
@@ -145,7 +146,7 @@ def main():
         neighbor_genera = [x[1] for x in neighbors]
         neighbor_taxonomy = taxonomy_lookup.loc[neighbor_genera]
 
-        genus_taxonomy = taxonomy_lookup.loc[genus]
+        genus_taxonomy = taxonomy_lookup.loc[genera[i]]
 
         genus_family = genus_taxonomy.worms_family
         if family_count[genus_family] > 1:
@@ -167,11 +168,14 @@ def main():
 
     df_ref = df_ref[df_ref.worms_genus.isin(df_trait_data.worms_genus)]
 
+    df_ref = df_ref[df_ref.nearest_k_class_fraction > 0]
+
     selection_cols = [
         "worms_class",
         "worms_order",
         "worms_family",
         "worms_genus",
+        "worms_name",
         "nearest_k_family_fraction",
         "nearest_k_order_fraction",
         "nearest_k_class_fraction",
@@ -182,23 +186,26 @@ def main():
 
     df_ref = df_ref.sort_values(
         selection_cols,
-        ascending=[True, True, True, True, False, False, False, False, False, True],
+        ascending=[True, True, True, True, True, False, False, False, False, False, True],
     )
 
-    df_ref = df_ref.groupby("worms_genus", sort=False, group_keys=False).head(1)
+    df_ref = df_ref.groupby("worms_name", sort=False, group_keys=False).head(1)
 
     df_ref[selection_cols].to_csv(cfg.output_selection)
 
     df_final = df.loc[df_ref.index.union(df_out.index)]
 
+    newick_compat = str.maketrans({" ": "_", "(": "", ")": ""})
     with open(cfg.output_fasta, "w") as f:
         f.writelines(
-            f">{row.worms_genus}\n{seq}\n"
+            f">{row.worms_name.translate(newick_compat)}\n{seq}\n"
             for (_, row), seq in zip(df_final.iterrows(), create_compressed_alignment(df_final))
         )
 
     with open(cfg.output_outgroup, "w") as f:
-        f.write(",".join(f"{row.worms_genus}" for _, row in df_out.iterrows()))
+        f.write(
+            ",".join(f"{row.worms_name.translate(newick_compat)}" for _, row in df_out.iterrows())
+        )
 
     write_itol_colorstrip(
         df_ref,

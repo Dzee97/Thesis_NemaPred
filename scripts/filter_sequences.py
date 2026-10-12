@@ -2,12 +2,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import skbio
-from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.cluster.hierarchy import fcluster, linkage, dendrogram
 from skbio.alignment import align_dists
 from sklearn.metrics import silhouette_samples
 from src.common import parse_config
@@ -111,6 +112,27 @@ def create_compressed_alignment(df: pd.DataFrame) -> list[skbio.RNA]:
     return aligned_sequences
 
 
+def plot_genus_tree(linkage, genus, labels, threshold, save_path):
+    plt.figure(figsize=(8, 5))
+    plt.title(f"TN93 Clustering Dendrogram: {genus}", fontsize=14)
+
+    dendrogram(
+        linkage,
+        labels=labels,
+        orientation="right",
+        color_threshold=0,
+        above_threshold_color="skyblue",
+    )
+
+    plt.axvline(x=threshold, color="r", linestyle="--", linewidth="2", label="Cutt-off")
+    plt.xlim((0, threshold * 2))
+    plt.legend()
+
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
+
 def main():
     snakemake = globals().get("snakemake", None)
     cfg = parse_config(Config, snakemake)
@@ -170,15 +192,22 @@ def main():
         df_ref.groupby(taxonomy_cols).size().astype("Int64")
     )
 
-    # 6. Group by (genus, cluster) and keep only the longest sequence
+    # 6. Group by (species, cluster) and keep only the longest sequence
     df_ref = df_ref.sort_values(
-        ["worms_genus", "clust_id", "length", "otu_coverage", "ambiguity_frac"],
+        ["worms_name", "clust_id", "length", "otu_coverage", "ambiguity_frac"],
         ascending=[True, True, False, False, True],
     )
-    df_ref = df_ref.groupby(["worms_genus", "clust_id"], sort=False, group_keys=False).head(1)
+    df_ref = df_ref.groupby(["worms_name", "clust_id"], sort=False, group_keys=False).head(1)
 
-    genus_cov["Genus x global cluster"] = df_ref.groupby(taxonomy_cols).size().astype("Int64")
+    genus_cov["Species x global cluster"] = df_ref.groupby(taxonomy_cols).size().astype("Int64")
 
+    # Remove sequence with only genus when species are available
+    df_ref["species_level"] = df_ref.worms_rank == "Species"
+    df_ref["species_avail"] = df_ref.groupby("worms_genus").species_level.transform("any")
+
+    df_ref = df_ref[(df_ref["species_level"] | ~(df_ref["species_avail"]))]
+
+    # 7. Filter out sequences that are extermely divergent to the other sequences
     msa = skbio.TabularMSA(create_compressed_alignment(df_ref), index=df_ref.index)
     dist = align_dists(msa, metric=cfg.dist_model, gamma=cfg.model_gamma, shared_by_all=False)
     dist.data[dist.data < 0.0] = 0.0
@@ -189,9 +218,6 @@ def main():
     median_dist = np.nanmedian(dist_data, axis=1)
     z_scores = (median_dist - median_dist.mean()) / median_dist.std()
 
-    # print_phylo_z_distribution(z_scores, outlier_threshold=cfg.max_z_score)
-
-    # 7. Filter out sequences that are extermely divergent to the other sequences
     keep_indices = np.flatnonzero(z_scores <= cfg.max_z_score)
     df_ref = df_ref.iloc[keep_indices]
     dist = cast(skbio.DistanceMatrix, dist.filter(list(df_ref.index)))
@@ -201,41 +227,48 @@ def main():
     )
 
     # 8. Perform hierarchical clustering on every genus
-    genera = df_ref.worms_genus.to_numpy()
-    genera_clusters = np.arange(len(genera), dtype=np.int16)
-    genera_silhouette_coefs = np.full(len(genera), np.nan)
-    genera_linkages = {}
+    species = df_ref.worms_name.to_numpy()
+    species_clusters = np.arange(len(species), dtype=np.int16)
+    species_silhouette_coefs = np.full(len(species), np.nan)
+    species_linkages = {}
 
-    for genus in np.unique(genera):
-        genus_idx = np.flatnonzero(genera == genus)
+    for sp in np.unique(species):
+        species_idx = np.flatnonzero(species == sp)
 
-        if len(genus_idx) < 4:
+        if len(species_idx) < 2:
             continue
 
-        genus_dist = cast(skbio.DistanceMatrix, dist.filter(list(df_ref.index[genus_idx])))
-        genus_linkage = linkage(genus_dist.condensed_form(), method="average")
-        genera_linkages[genus] = genus_linkage
+        species_dist = cast(skbio.DistanceMatrix, dist.filter(list(df_ref.index[species_idx])))
+        species_linkage = linkage(species_dist.condensed_form(), method="average")
+        species_linkages[sp] = species_linkage
 
-        labels = fcluster(genus_linkage, cfg.genus_clusters, criterion="maxclust")
-        coefs = silhouette_samples(genus_dist.data, labels, metric="precomputed")
+        labels = fcluster(species_linkage, 0.1, criterion="distance")
+        if 1 < len(np.unique(labels)) < len(species_idx):
+            coefs = silhouette_samples(species_dist.data, labels, metric="precomputed")
+        else:
+            coefs = np.full(len(species_idx), np.nan)
 
-        genera_clusters[genus_idx] = labels
-        genera_silhouette_coefs[genus_idx] = coefs
+        species_clusters[species_idx] = labels
+        species_silhouette_coefs[species_idx] = coefs
 
-    df_ref["genus_cluster"] = genera_clusters
-    df_ref["genus_silhouette_coefs"] = genera_silhouette_coefs
+        plot_genus_tree(
+            species_linkage, sp, list(df_ref.index[species_idx]), 0.1, f"plots/{sp}.png"
+        )
 
-    df_ref["genus_long_enough"] = df_ref.length >= (
-        df_ref.groupby(["worms_genus", "genus_cluster"]).length.transform("max")
+    df_ref["species_cluster"] = species_clusters
+    df_ref["species_silhouette_coefs"] = species_silhouette_coefs
+
+    df_ref["species_long_enough"] = df_ref.length >= (
+        df_ref.groupby(["worms_name", "species_cluster"]).length.transform("max")
         * cfg.min_length_frac
     )
 
     df_ref = df_ref.sort_values(
         [
-            "worms_genus",
-            "genus_cluster",
-            "genus_long_enough",
-            "genus_silhouette_coefs",
+            "worms_name",
+            "species_cluster",
+            "species_long_enough",
+            "species_silhouette_coefs",
             "length",
             "otu_coverage",
             "ambiguity_frac",
@@ -243,15 +276,16 @@ def main():
         ascending=[True, True, False, False, False, False, True],
     )
 
-    df_ref = df_ref.groupby(["worms_genus", "genus_cluster"], sort=False, group_keys=False).head(1)
+    df_ref = df_ref.groupby(["worms_name", "species_cluster"], sort=False, group_keys=False).head(1)
 
-    genus_cov["Genus cluster reps"] = df_ref.groupby(taxonomy_cols).size().astype("Int64")
+    genus_cov["Species cluster reps"] = df_ref.groupby(taxonomy_cols).size().astype("Int64")
 
     genus_cov.to_csv(cfg.output_genus_cov)
 
+    newick_compat = str.maketrans({" ": "_", "(": "", ")": ""})
     with open(cfg.output_fasta, "w") as f:
         f.writelines(
-            f">{accession}_{row.worms_genus}\n{seq}\n"
+            f">{accession}_{row.worms_name.translate(newick_compat)}\n{seq}\n"
             for (accession, row), seq in zip(df_ref.iterrows(), create_compressed_alignment(df_ref))
         )
 

@@ -163,12 +163,12 @@ rule create_18s_final_tree:
         model = "GTR+G+I",
         raxml_dir = RAXML_DATA_DIR,
         prefix_final = RAXML_DATA_DIR  / "Final_tree_18S",
-        pars_trees = 100,
-        rand_trees = 100
+        pars_trees = 50,
+        rand_trees = 50
     output:
         out_best_tree = RAXML_DATA_DIR / "Final_tree_18S.raxml.bestTree"
     shell:
         """
         mkdir -p {params.raxml_dir}
-        raxml-ng --search --model {params.model} --msa {input.input_fasta} --prefix {params.prefix_final} --seed {SEED} --outgroup $(cat {input.input_outgroup}) --tree pars{{{params.pars_trees}}},rand{{{params.rand_trees}}}
+        raxml-ng --all --model {params.model} --msa {input.input_fasta} --prefix {params.prefix_final} --seed {SEED} --outgroup $(cat {input.input_outgroup}) --tree pars{{{params.pars_trees}}},rand{{{params.rand_trees}}}
         """
