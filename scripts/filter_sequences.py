@@ -8,7 +8,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import skbio
-from scipy.cluster.hierarchy import fcluster, linkage, dendrogram
+from scipy.cluster.hierarchy import dendrogram, fcluster, linkage
 from skbio.alignment import align_dists
 from sklearn.metrics import silhouette_samples
 from src.common import parse_config
@@ -26,8 +26,8 @@ class Config:
     dist_model: str
     model_gamma: float
     max_z_score: float
-    genus_clusters: int
-    min_length_frac: float
+    worms_name_cluster_dist: float
+    worms_name_length_frac: float
 
 
 def print_phylo_z_distribution(z_arr, outlier_threshold=2.5):
@@ -112,9 +112,9 @@ def create_compressed_alignment(df: pd.DataFrame) -> list[skbio.RNA]:
     return aligned_sequences
 
 
-def plot_genus_tree(linkage, genus, labels, threshold, save_path):
+def plot_name_tree(linkage, name, labels, threshold, save_path):
     plt.figure(figsize=(8, 5))
-    plt.title(f"TN93 Clustering Dendrogram: {genus}", fontsize=14)
+    plt.title(f"TN93 Clustering Dendrogram: {name}", fontsize=14)
 
     dendrogram(
         linkage,
@@ -201,12 +201,6 @@ def main():
 
     genus_cov["Species x global cluster"] = df_ref.groupby(taxonomy_cols).size().astype("Int64")
 
-    # Remove sequence with only genus when species are available
-    df_ref["species_level"] = df_ref.worms_rank == "Species"
-    df_ref["species_avail"] = df_ref.groupby("worms_genus").species_level.transform("any")
-
-    df_ref = df_ref[(df_ref["species_level"] | ~(df_ref["species_avail"]))]
-
     # 7. Filter out sequences that are extermely divergent to the other sequences
     msa = skbio.TabularMSA(create_compressed_alignment(df_ref), index=df_ref.index)
     dist = align_dists(msa, metric=cfg.dist_model, gamma=cfg.model_gamma, shared_by_all=False)
@@ -226,49 +220,44 @@ def main():
         df_ref.groupby(taxonomy_cols).size().astype("Int64")
     )
 
-    # 8. Perform hierarchical clustering on every genus
-    species = df_ref.worms_name.to_numpy()
-    species_clusters = np.arange(len(species), dtype=np.int16)
-    species_silhouette_coefs = np.full(len(species), np.nan)
-    species_linkages = {}
+    # 8. Perform hierarchical clustering on every species/genus
+    worms_names = df_ref.worms_name.to_numpy()
+    worms_name_clusters = np.arange(len(worms_names), dtype=np.int16)
+    worms_name_silhouette_coefs = np.full(len(worms_names), np.nan)
+    for name in np.unique(worms_names):
+        name_idx = np.flatnonzero(worms_names == name)
 
-    for sp in np.unique(species):
-        species_idx = np.flatnonzero(species == sp)
-
-        if len(species_idx) < 2:
+        if len(name_idx) < 2:
             continue
 
-        species_dist = cast(skbio.DistanceMatrix, dist.filter(list(df_ref.index[species_idx])))
-        species_linkage = linkage(species_dist.condensed_form(), method="average")
-        species_linkages[sp] = species_linkage
+        name_dist = cast(skbio.DistanceMatrix, dist.filter(list(df_ref.index[name_idx])))
+        name_linkage = linkage(name_dist.condensed_form(), method="average")
 
-        labels = fcluster(species_linkage, 0.1, criterion="distance")
-        if 1 < len(np.unique(labels)) < len(species_idx):
-            coefs = silhouette_samples(species_dist.data, labels, metric="precomputed")
+        labels = fcluster(name_linkage, cfg.worms_name_cluster_dist, criterion="distance")
+        if 1 < len(np.unique(labels)) < len(name_idx):
+            coefs = silhouette_samples(name_dist.data, labels, metric="precomputed")
         else:
-            coefs = np.full(len(species_idx), np.nan)
+            coefs = np.full(len(name_idx), np.nan)
 
-        species_clusters[species_idx] = labels
-        species_silhouette_coefs[species_idx] = coefs
+        worms_name_clusters[name_idx] = labels
+        worms_name_silhouette_coefs[name_idx] = coefs
 
-        plot_genus_tree(
-            species_linkage, sp, list(df_ref.index[species_idx]), 0.1, f"plots/{sp}.png"
-        )
+        plot_name_tree(name_linkage, name, list(df_ref.index[name_idx]), 0.1, f"plots/{name}.png")
 
-    df_ref["species_cluster"] = species_clusters
-    df_ref["species_silhouette_coefs"] = species_silhouette_coefs
+    df_ref["worms_name_cluster"] = worms_name_clusters
+    df_ref["worms_name_silhouette_coefs"] = worms_name_silhouette_coefs
 
-    df_ref["species_long_enough"] = df_ref.length >= (
-        df_ref.groupby(["worms_name", "species_cluster"]).length.transform("max")
-        * cfg.min_length_frac
+    df_ref["worms_name_long_enough"] = df_ref.length >= (
+        df_ref.groupby(["worms_name", "worms_name_cluster"]).length.transform("max")
+        * cfg.worms_name_length_frac
     )
 
     df_ref = df_ref.sort_values(
         [
             "worms_name",
-            "species_cluster",
-            "species_long_enough",
-            "species_silhouette_coefs",
+            "worms_name_cluster",
+            "worms_name_long_enough",
+            "worms_name_silhouette_coefs",
             "length",
             "otu_coverage",
             "ambiguity_frac",
@@ -276,9 +265,36 @@ def main():
         ascending=[True, True, False, False, False, False, True],
     )
 
-    df_ref = df_ref.groupby(["worms_name", "species_cluster"], sort=False, group_keys=False).head(1)
+    df_ref = df_ref.groupby(
+        ["worms_name", "worms_name_cluster"], sort=False, group_keys=False
+    ).head(1)
+    dist = cast(skbio.DistanceMatrix, dist.filter(list(df_ref.index)))
 
-    genus_cov["Species cluster reps"] = df_ref.groupby(taxonomy_cols).size().astype("Int64")
+    genus_cov["worms name cluster reps"] = df_ref.groupby(taxonomy_cols).size().astype("Int64")
+
+    # 9. Remove genus only sequences that are too similar to a species
+    worms_genera = df_ref.worms_genus.to_numpy()
+    worms_species_level = (df_ref.worms_rank == "Species").to_numpy()
+
+    keep = np.ones(len(df_ref), dtype=bool)
+
+    for genus in worms_genera:
+        genus_idx = np.flatnonzero(worms_genera == genus)
+
+        named_idx = genus_idx[worms_species_level[genus_idx]]
+        if len(named_idx) == 0:
+            continue
+
+        unnamed_idx = genus_idx[~worms_species_level[genus_idx]]
+        for i in unnamed_idx:
+            nearest_named_dist = np.min(dist.data[i, named_idx])
+
+            if nearest_named_dist <= cfg.worms_name_cluster_dist:
+                keep[i] = False
+
+    df_ref = df_ref.iloc[np.flatnonzero(keep)]
+
+    genus_cov["filter genus redundancy"] = df_ref.groupby(taxonomy_cols).size().astype("Int64")
 
     genus_cov.to_csv(cfg.output_genus_cov)
 
