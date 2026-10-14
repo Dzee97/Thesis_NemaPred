@@ -6,6 +6,7 @@ DATA_DIR = Path(config["project"]["data_dir"])
 RAW_DATA_DIR = DATA_DIR / "raw"
 PROCESSED_DATA_DIR = DATA_DIR / "processed"
 RAXML_DATA_DIR = PROCESSED_DATA_DIR / "raxml"
+PASTML_DATA_DIR = PROCESSED_DATA_DIR / "pastml"
 
 OUTPUT_DIR = Path(config["project"]["output_dir"])
 LOG_DIR = Path(config["project"]["log_dir"])
@@ -163,9 +164,21 @@ rule create_18s_final_tree:
         pars_trees = 50,
         rand_trees = 50
     output:
-        out_best_tree = RAXML_DATA_DIR / "Final_tree_18S.raxml.bestTree"
+        out_best_tree = RAXML_DATA_DIR / "Final_tree_18S.raxml.support"
     shell:
         """
         mkdir -p {params.raxml_dir}
         raxml-ng --all --model {params.model} --msa {input.input_fasta} --prefix {params.prefix_final} --seed {SEED} --outgroup $(cat {input.input_outgroup}) --tree pars{{{params.pars_trees}}},rand{{{params.rand_trees}}}
         """
+
+rule run_18s_pastml:
+    input:
+        input_tree = RAXML_DATA_DIR / "Final_tree_18S.raxml.support",
+        input_trait_data = PROCESSED_DATA_DIR / "Trait_data.csv"
+    params:
+        output_acr_dir = PASTML_DATA_DIR
+    output:
+        output_tree = PASTML_DATA_DIR / "Final_tree_18S_annotated.nwk",
+        output_tree_support = PASTML_DATA_DIR / "Final_tree_18S_support.csv"
+    script:
+        "scripts/run_pastml.py"
