@@ -23,3 +23,11 @@ Context: The original paper that describes the PEM framework
 ## [MarNemaFunDiv: a first comprehensive dataset of functional traits for marine nematodes](https://www.nature.com/articles/s41597-025-05105-6)
 
 Context: The paper for the genus level trait dataset.
+
+## [Evaluation of combined morphological and molecular techniques for marine nematode (Terschellingia spp.) identification](https://link.springer.com/article/10.1007/s00227-008-0945-8)
+
+Support for cryptic species within Terschellingia longicaudata (two Bahrain samples)
+
+## [Persistent Gaps and Errors in Reference Databases Impede Ecologically Meaningful Taxonomy Assignments in 18S rRNA Studies: A Case Study of Terrestrial and Marine Nematodes](https://onlinelibrary.wiley.com/doi/full/10.1002/edn3.70080)
+
+Support for Terschellingia sp. 1 in Theristus clade
