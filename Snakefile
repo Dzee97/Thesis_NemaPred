@@ -173,10 +173,12 @@ rule create_18s_final_tree:
 
 rule run_18s_pastml:
     input:
-        input_tree = RAXML_DATA_DIR / "Final_tree_18S.raxml.support",
-        input_trait_data = PROCESSED_DATA_DIR / "Trait_data.csv"
+        input_trait_data = PROCESSED_DATA_DIR / "Trait_data.csv",
+        input_ml_tree = RAXML_DATA_DIR / "Final_tree_18S.raxml.support",
+        input_bootstrap_trees = RAXML_DATA_DIR / "Final_tree_18S.raxml.bootstraps"
     params:
         output_acr_dir = PASTML_DATA_DIR
+        num_cores = 
     output:
         output_tree = PASTML_DATA_DIR / "Final_tree_18S_annotated.nwk",
         output_tree_support = PASTML_DATA_DIR / "Final_tree_18S_support.csv"
