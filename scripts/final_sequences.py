@@ -7,6 +7,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import skbio
+from filter_sequences import mark_redundant
 from matplotlib import colormaps
 from matplotlib.colors import to_hex
 from sklearn.metrics import silhouette_samples
@@ -47,83 +48,32 @@ def main():
     df: pd.DataFrame = pa_table.to_pandas(types_mapper=pd.ArrowDtype, ignore_metadata=True)
     df.set_index("accession", inplace=True)
 
-    selection_cols = [
-        "worms_rank",
-        "worms_class",
-        "worms_order",
-        "worms_family",
-        "worms_genus",
-        "worms_name",
-        "length",
-        "otu_coverage",
-        "ambiguity_frac",
-    ]
-
-    df_ref = df[df.seq_type == "ref"][selection_cols].copy()
-    df_out = df[df.seq_type == "outgroup"][selection_cols].copy()
+    df_ref = df[df.seq_type == "ref"].copy()
+    df_out = df[df.seq_type == "outgroup"].copy()
 
     tree: skbio.TreeNode | Any
     tree = skbio.read(cfg.input_tree, format="newick", into=skbio.TreeNode)
     tree_dist = tree.cophenet()
     tree_dist.ids = [id.split()[0] for id in tree_dist.ids]
-    tree_dist_data = tree_dist.data.copy()
-    np.fill_diagonal(tree_dist_data, np.nan)
 
     df_ref = df_ref.loc[list(tree_dist.ids)]
 
-    df_ref["worms_family_silhoette_coef"] = np.asarray(
-        silhouette_samples(tree_dist.data, df_ref.worms_family.to_numpy(), metric="precomputed")
-    )
-    df_ref["worms_family_silhoette_genus_median"] = df_ref.groupby(
-        "worms_genus"
-    ).worms_family_silhoette_coef.transform("median")
+    keep = mark_redundant(df_ref, tree_dist.data)
 
-    df_ref["worms_family_silhoette_genus_central"] = df_ref.worms_family_silhoette_coef >= (
-        df_ref.worms_family_silhoette_genus_median - 0.3
-    )
-
-    df_trait_data = pd.read_csv(cfg.input_trait_data, usecols=["worms_genus"])
-    df_ref = df_ref[df_ref.worms_genus.isin(df_trait_data.worms_genus)]
-
-    df_ref = df_ref.sort_values(
-        [
-            "worms_class",
-            "worms_order",
-            "worms_family",
-            "worms_genus",
-            "worms_name",
-            "worms_family_silhoette_genus_central",
-            "length",
-            "otu_coverage",
-            "ambiguity_frac",
-        ],
-        ascending=[True, True, True, True, True, False, False, False, True],
-    )
+    df_ref = df_ref.loc[keep]
 
     is_genus = df_ref.worms_rank == "Genus"
-    group_rank = df_ref.groupby("worms_name", sort=False, group_keys=False).cumcount()
+    multiple_seqs = df_ref.groupby("worms_name").worms_name.transform("count") > 1
+    unassigned_nums = df_ref[multiple_seqs].groupby("worms_name").cumcount() + 1
 
-    df_ref["keep"] = df_ref.worms_family_silhoette_genus_central & (
-        is_genus | (~is_genus & (group_rank == 0))
-    )
-
-    df_keep = df_ref[df_ref["keep"]]
-    is_genus = df_keep.worms_rank == "Genus"
-    multiple_seqs = df_keep.groupby("worms_name").worms_name.transform("count") > 1
-    unassigned_nums = df_keep[(is_genus & multiple_seqs)].groupby("worms_name").cumcount() + 1
-
-    tip_name = df_keep["worms_name"].copy()
-    tip_name[is_genus] += " sp. "
-    tip_name[(is_genus & multiple_seqs)] += " " + unassigned_nums.astype(str)
-
-    df_ref.loc[df_ref["keep"], "tip_name"] = tip_name
+    tip_name = df_ref["worms_name"].copy()
+    tip_name[is_genus] += " sp."
+    tip_name[multiple_seqs] += " " + unassigned_nums.astype(str)
 
     df_ref.to_csv(cfg.output_selection)
 
-    df_ref = df_ref[df_ref["keep"]]
-
-    df_alignment = df.loc[df_ref.index.union(df_out.index)][["rna_seq", "msa_pos"]]
-    df_alignment["tip_name"] = pd.concat([df_ref.tip_name, df_out.worms_name])
+    df_alignment = df.loc[df_ref.index.union(df_out.index)]
+    df_alignment["tip_name"] = pd.concat([tip_name, df_out.worms_name])
 
     newick_compat = str.maketrans({" ": "_", "(": "", ")": ""})
     with open(cfg.output_fasta, "w") as f:

@@ -1,15 +1,15 @@
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import skbio
-from scipy.cluster.hierarchy import dendrogram, fcluster, linkage
 from skbio.alignment import align_dists
+from skbio.tree import nj, nni
 from sklearn.metrics import silhouette_samples
 from src.common import parse_config
 
@@ -18,6 +18,7 @@ from src.common import parse_config
 class Config:
     input_parquet: Path
     input_trait_data: Path
+    output_raxml_dir: Path
     output_fasta: Path
     output_genus_cov: Path
     min_length: int
@@ -26,75 +27,7 @@ class Config:
     dist_model: str
     model_gamma: float
     max_z_score: float
-    worms_name_cluster_dist: float
-    worms_name_length_frac: float
-
-
-def print_phylo_z_distribution(z_arr, outlier_threshold=2.5):
-    total = len(z_arr)
-
-    # 1. Categorize into customized evolutionary distance bins
-    close_conserved = np.sum(z_arr < 0)  # Closer than average
-    mod_divergent = np.sum((z_arr >= 0) & (z_arr < 1.0))
-    highly_divergent = np.sum((z_arr >= 1.0) & (z_arr < outlier_threshold))
-    potential_outliers = np.sum(z_arr >= outlier_threshold)  # Long divergent tail
-
-    # Custom row formatting function
-    def format_row(label, count, description):
-        pct = (count / total) * 100
-        bar = "█" * int(pct / 2)  # 1 block per 2%
-        return f"{label:<25} | {count:>5} ({pct:>5.1f}%) | {description:<30} | {bar}"
-
-    # 2. Print Distribution Report
-    print(f"\n{' PHYLOGENETIC SEQUENCE OUTLIER REPORT ':^85}")
-    print("=" * 85)
-    print(
-        f"{'Z-Score (Distance) Band':<25} | {'Count / Pct':<12} | {'Biological Context':<30} | Visual Density"
-    )
-    print("-" * 85)
-    print(format_row("Z < 0 (Negative)", close_conserved, "Highly Conserved / Similar Sequences"))
-    print(format_row("0 <= Z < 1.0", mod_divergent, "Standard Evolutionary Variance"))
-    print(
-        format_row(
-            "1.0 <= Z < " + str(outlier_threshold), highly_divergent, "Divergent (Keep in tree)"
-        )
-    )
-    print(
-        format_row(
-            f"Z >= {outlier_threshold} (Positive)",
-            potential_outliers,
-            "CRITICAL: Highly Divergent/Outliers",
-        )
-    )
-    print("=" * 85)
-
-    # 3. Basic Metrics
-    print(f"Total Sequences Analyzed: {total}")
-    print(
-        f"Minimum Z-score:          {np.min(z_arr):.2f} (Bounded by absolute sequence identity limits)"
-    )
-    print(f"Maximum Z-score:          {np.max(z_arr):.2f}")
-
-    # 4. Outlier Recommendations
-    outlier_indices = np.where(z_arr >= outlier_threshold)[0]
-
-    print("\n" + "-" * 85)
-    if len(outlier_indices) > 0:
-        print(
-            f"❌ ACTION REQUIRED: Found {len(outlier_indices)} sequence(s) exceeding Z = {outlier_threshold}."
-        )
-        print(
-            "   These sequences have an abnormally high average distance to the rest of the alignment."
-        )
-        print("   Consider removing them to prevent long-branch attraction artifacts in your tree.")
-        print(f"   Outlier Array Indices: {outlier_indices.tolist()}")
-        print(f"   Outlier Z-scores:      {np.round(z_arr[outlier_indices], 2).tolist()}")
-    else:
-        print(
-            f"✅ CLEAN SET: No sequences exceeded the positive outlier threshold of Z = {outlier_threshold}."
-        )
-        print("   Your alignment distances are stable enough for phylogenetic reconstruction.")
-    print("-" * 85)
+    raxml_model: str
 
 
 def create_compressed_alignment(df: pd.DataFrame) -> list[skbio.RNA]:
@@ -112,25 +45,101 @@ def create_compressed_alignment(df: pd.DataFrame) -> list[skbio.RNA]:
     return aligned_sequences
 
 
-def plot_name_tree(linkage, name, labels, threshold, save_path):
-    plt.figure(figsize=(8, 5))
-    plt.title(f"TN93 Clustering Dendrogram: {name}", fontsize=14)
+def mark_redundant(df_ref: pd.DataFrame, dist_data: np.ndarray) -> np.ndarray:
+    worms_genus = df_ref.worms_genus.to_numpy()
+    worms_name = df_ref.worms_name.to_numpy()
+    worms_rank = df_ref.worms_rank.to_numpy()
 
-    dendrogram(
-        linkage,
-        labels=labels,
-        orientation="right",
-        color_threshold=0,
-        above_threshold_color="skyblue",
+    sil_coefs = np.asarray(silhouette_samples(dist_data, worms_genus))
+
+    dist_data = dist_data.copy()
+    np.fill_diagonal(dist_data, np.nan)
+
+    keep = np.ones(len(df_ref), dtype=bool)
+    iter_num = 0
+
+    while True:
+        keep_idx = np.flatnonzero(keep)
+        to_remove = set()
+
+        for idx in keep_idx:
+            if idx in to_remove:
+                continue
+
+            local_closest = np.nanargmin(dist_data[idx, keep_idx])
+            closest_idx = keep_idx[local_closest]
+
+            if worms_genus[idx] == worms_genus[closest_idx]:
+                if worms_name[idx] == worms_name[closest_idx]:
+                    worst_idx = min(closest_idx, idx, key=lambda x: sil_coefs[x])
+                elif worms_rank[idx] != worms_rank[closest_idx]:
+                    worst_idx = idx if worms_rank[idx] == "Genus" else closest_idx
+                else:
+                    continue
+
+                to_remove.add(worst_idx)
+
+        if to_remove:
+            keep[list(to_remove)] = False
+            print(f"Mark {len(to_remove)}, keep {sum(keep)}")
+        else:
+            break
+
+        iter_num += 1
+
+    return keep
+
+
+def remove_redundant(
+    df_ref: pd.DataFrame, dist: skbio.DistanceMatrix, on_tree=False
+) -> tuple[pd.DataFrame, skbio.DistanceMatrix]:
+    iter_count = 0
+
+    while True:
+        iter_count += 1
+
+        if on_tree:
+            print(f"Remove redundant on NJ cophenet - iter {iter_count}")
+
+            tree = nj(dist)
+            tree_dist = tree.cophenet()
+            tree_dist = tree_dist.filter(list(df_ref.index))
+            dist_data = tree_dist.data
+        else:
+            print(f"Remove redundant on TN93 dist - iter {iter_count}")
+
+            dist_data = dist.data
+
+        keep = mark_redundant(df_ref, dist_data)
+
+        if sum(keep) == len(df_ref):
+            return df_ref, dist
+
+        df_ref = df_ref.loc[keep]
+        dist = cast(skbio.DistanceMatrix, dist.filter(list(df_ref.index)))
+
+
+def remove_family_outliers(
+    df_ref: pd.DataFrame, dist: skbio.DistanceMatrix, silhoette_margin=0.5
+) -> tuple[pd.DataFrame, skbio.DistanceMatrix]:
+    worms_family = df_ref.worms_family.to_numpy()
+    family_silhoette_coef = np.asarray(
+        silhouette_samples(dist.data, worms_family, metric="precomputed")
     )
+    family_silhoette_median = np.full(len(worms_family), np.nan)
 
-    plt.axvline(x=threshold, color="r", linestyle="--", linewidth="2", label="Cutt-off")
-    plt.xlim((0, threshold * 2))
-    plt.legend()
+    for family in np.unique(worms_family):
+        family_idx = np.flatnonzero(worms_family == family)
+        family_silhoette_median[family_idx] = np.median(family_silhoette_coef[family_idx])
 
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
+    family_central = family_silhoette_coef >= (family_silhoette_median - silhoette_margin)
+
+    print(f"Removed {sum(~family_central)} family outliers, keep {sum(family_central)}")
+
+    df_ref = df_ref[family_central]
+    dist = cast(skbio.DistanceMatrix, dist.filter(list(df_ref.index)))
+
+    return df_ref, dist
 
 
 def main():
@@ -141,7 +150,7 @@ def main():
     df: pd.DataFrame = pa_table.to_pandas(types_mapper=pd.ArrowDtype, ignore_metadata=True)
     df.set_index("accession", inplace=True)
 
-    df_ref = df[df.seq_type == "ref"].copy()
+    df_ref = df[df.seq_type == "ref"]
 
     taxonomy_cols = ["worms_class", "worms_order", "worms_family", "worms_genus"]
 
@@ -150,11 +159,11 @@ def main():
         usecols=taxonomy_cols,
     )
 
-    # 1. Filter out all sequences that dont share an order with the trait genera and are not marine
+    # 1. Filter out all sequences that dont share an family with the trait genera and are not marine
     df_ref = df_ref[
         (~df_ref.worms_genus.isna())
         & (df_ref.worms_ismarine)
-        & (df_ref.worms_order.isin(df_trait_genera.worms_order))
+        & (df_ref.worms_family.isin(df_trait_genera.worms_family))
     ]
 
     genus_cov_index = pd.MultiIndex.from_frame(df_trait_genera).union(
@@ -220,81 +229,53 @@ def main():
         df_ref.groupby(taxonomy_cols).size().astype("Int64")
     )
 
-    # 8. Perform hierarchical clustering on every species/genus
-    worms_names = df_ref.worms_name.to_numpy()
-    worms_name_clusters = np.arange(len(worms_names), dtype=np.int16)
-    worms_name_silhouette_coefs = np.full(len(worms_names), np.nan)
-    for name in np.unique(worms_names):
-        name_idx = np.flatnonzero(worms_names == name)
+    current_len = len(df_ref)
+    iter_count = 0
 
-        if len(name_idx) < 2:
-            continue
+    while True:
+        iter_count += 1
 
-        name_dist = cast(skbio.DistanceMatrix, dist.filter(list(df_ref.index[name_idx])))
-        name_linkage = linkage(name_dist.condensed_form(), method="average")
+        # 8. Iterively remove sequences based on close neighbor same genus agreement
+        df_ref, dist = remove_redundant(df_ref, dist, on_tree=False)
 
-        labels = fcluster(name_linkage, cfg.worms_name_cluster_dist, criterion="distance")
-        if 1 < len(np.unique(labels)) < len(name_idx):
-            coefs = silhouette_samples(name_dist.data, labels, metric="precomputed")
-        else:
-            coefs = np.full(len(name_idx), np.nan)
+        genus_cov[f"I{iter_count} - TN93 genus redundancy"] = (
+            df_ref.groupby(taxonomy_cols).size().astype("Int64")
+        )
 
-        worms_name_clusters[name_idx] = labels
-        worms_name_silhouette_coefs[name_idx] = coefs
+        # 9. Perform NJ and again remove redundant sequences
+        df_ref, dist = remove_redundant(df_ref, dist, on_tree=True)
 
-        plot_name_tree(name_linkage, name, list(df_ref.index[name_idx]), 0.1, f"plots/{name}.png")
+        genus_cov[f"I{iter_count} - NJ genus redundancy"] = (
+            df_ref.groupby(taxonomy_cols).size().astype("Int64")
+        )
 
-    df_ref["worms_name_cluster"] = worms_name_clusters
-    df_ref["worms_name_silhouette_coefs"] = worms_name_silhouette_coefs
+        # 10. Filter outliers by family silhoutte scores
+        df_ref, dist = remove_family_outliers(df_ref, dist)
 
-    df_ref["worms_name_long_enough"] = df_ref.length >= (
-        df_ref.groupby(["worms_name", "worms_name_cluster"]).length.transform("max")
-        * cfg.worms_name_length_frac
-    )
+        genus_cov[f"I{iter_count} - Family outliers"] = (
+            df_ref.groupby(taxonomy_cols).size().astype("Int64")
+        )
 
-    df_ref = df_ref.sort_values(
-        [
-            "worms_name",
-            "worms_name_cluster",
-            "worms_name_long_enough",
-            "worms_name_silhouette_coefs",
-            "length",
-            "otu_coverage",
-            "ambiguity_frac",
-        ],
-        ascending=[True, True, False, False, False, False, True],
-    )
+        if len(df_ref) == current_len:
+            break
 
-    df_ref = df_ref.groupby(
-        ["worms_name", "worms_name_cluster"], sort=False, group_keys=False
-    ).head(1)
+        current_len = len(df_ref)
+
+    # 11. Limit to target genera and again remove outliers
+    df_ref = df_ref[df_ref.worms_genus.isin(df_trait_genera.worms_genus)]
     dist = cast(skbio.DistanceMatrix, dist.filter(list(df_ref.index)))
 
-    genus_cov["worms name cluster reps"] = df_ref.groupby(taxonomy_cols).size().astype("Int64")
+    df_ref, dist = remove_redundant(df_ref, dist, on_tree=False)
 
-    # 9. Remove genus only sequences that are too similar to a species
-    worms_genera = df_ref.worms_genus.to_numpy()
-    worms_species_level = (df_ref.worms_rank == "Species").to_numpy()
+    genus_cov["Trait only - TN93 genus redundancy"] = (
+        df_ref.groupby(taxonomy_cols).size().astype("Int64")
+    )
 
-    keep = np.ones(len(df_ref), dtype=bool)
+    df_ref, dist = remove_redundant(df_ref, dist, on_tree=True)
 
-    for genus in worms_genera:
-        genus_idx = np.flatnonzero(worms_genera == genus)
-
-        named_idx = genus_idx[worms_species_level[genus_idx]]
-        if len(named_idx) == 0:
-            continue
-
-        unnamed_idx = genus_idx[~worms_species_level[genus_idx]]
-        for i in unnamed_idx:
-            nearest_named_dist = np.min(dist.data[i, named_idx])
-
-            if nearest_named_dist <= cfg.worms_name_cluster_dist:
-                keep[i] = False
-
-    df_ref = df_ref.iloc[np.flatnonzero(keep)]
-
-    genus_cov["filter genus redundancy"] = df_ref.groupby(taxonomy_cols).size().astype("Int64")
+    genus_cov["Trait only - NJ genus redundancy"] = (
+        df_ref.groupby(taxonomy_cols).size().astype("Int64")
+    )
 
     genus_cov.to_csv(cfg.output_genus_cov)
 

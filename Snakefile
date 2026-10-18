@@ -115,8 +115,8 @@ rule filter_18s_sequences:
         dist_model = "tn93",
         model_gamma = 0.4,
         max_z_score = 3,
-        worms_name_cluster_dist = 0.1,
-        worms_name_length_frac = 0.8
+        raxml_model = "GTR+G",
+        output_raxml_dir = RAXML_DATA_DIR
     output:
         output_fasta = PROCESSED_DATA_DIR / "Filtered_18S_aligned.fasta",
         output_genus_cov = PROCESSED_DATA_DIR / "Filtered_18s_genus_coverage.csv"
@@ -168,7 +168,7 @@ rule create_18s_final_tree:
     shell:
         """
         mkdir -p {params.raxml_dir}
-        raxml-ng --all --model {params.model} --msa {input.input_fasta} --prefix {params.prefix_final} --seed {SEED} --outgroup $(cat {input.input_outgroup}) --tree pars{{{params.pars_trees}}},rand{{{params.rand_trees}}}
+        raxml-ng --search --model {params.model} --msa {input.input_fasta} --prefix {params.prefix_final} --seed {SEED} --outgroup $(cat {input.input_outgroup}) --tree pars{{{params.pars_trees}}},rand{{{params.rand_trees}}}
         """
 
 rule run_18s_pastml:
