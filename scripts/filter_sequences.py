@@ -50,7 +50,7 @@ def mark_redundant(df_ref: pd.DataFrame, dist_data: np.ndarray) -> np.ndarray:
     worms_name = df_ref.worms_name.to_numpy()
     worms_rank = df_ref.worms_rank.to_numpy()
 
-    sil_coefs = np.asarray(silhouette_samples(dist_data, worms_genus))
+    sil_coefs = np.asarray(silhouette_samples(dist_data, worms_genus, metric="precomputed"))
 
     dist_data = dist_data.copy()
     np.fill_diagonal(dist_data, np.nan)
@@ -120,23 +120,51 @@ def remove_redundant(
 
 
 def remove_family_outliers(
-    df_ref: pd.DataFrame, dist: skbio.DistanceMatrix, silhoette_margin=0.5
+    df_ref: pd.DataFrame, dist: skbio.DistanceMatrix, silhoette_margin=0.3, min_genera_per_family=3
 ) -> tuple[pd.DataFrame, skbio.DistanceMatrix]:
+
     worms_family = df_ref.worms_family.to_numpy()
+    worms_genus = df_ref.worms_genus.to_numpy()
+
     family_silhoette_coef = np.asarray(
         silhouette_samples(dist.data, worms_family, metric="precomputed")
     )
+    genus_silhoette_coef = np.asarray(
+        silhouette_samples(dist.data, worms_genus, metric="precomputed")
+    )
+
     family_silhoette_median = np.full(len(worms_family), np.nan)
+    family_testable = np.zeros(len(df_ref), dtype=bool)
 
     for family in np.unique(worms_family):
         family_idx = np.flatnonzero(worms_family == family)
-        family_silhoette_median[family_idx] = np.median(family_silhoette_coef[family_idx])
 
-    family_central = family_silhoette_coef >= (family_silhoette_median - silhoette_margin)
+        family_genera = np.unique(worms_genus[family_idx])
+        if len(family_genera) < min_genera_per_family:
+            continue
 
-    print(f"Removed {sum(~family_central)} family outliers, keep {sum(family_central)}")
+        genus_medians = []
+        for genus in family_genera:
+            genus_idx = np.flatnonzero((worms_family == family) & (worms_genus == genus))
+            genus_medians.append(np.median(family_silhoette_coef[genus_idx]))
 
-    df_ref = df_ref[family_central]
+        family_silhoette_median[family_idx] = np.median(genus_medians)
+        family_testable[family_idx] = True
+
+    family_outlier = (
+        family_testable
+        & (family_silhoette_coef < 0)
+        & (family_silhoette_coef < family_silhoette_median - silhoette_margin)
+    )
+
+    genus_size = df_ref.groupby("worms_genus").worms_genus.transform("size").to_numpy()
+    genus_outlier = (genus_size > 1) & (genus_silhoette_coef < 0)
+
+    remove = family_outlier & genus_outlier
+
+    print(f"Removed {sum(remove)} family outliers, keep {sum(~remove)}")
+
+    df_ref = df_ref[~remove]
     dist = cast(skbio.DistanceMatrix, dist.filter(list(df_ref.index)))
 
     return df_ref, dist
@@ -159,11 +187,11 @@ def main():
         usecols=taxonomy_cols,
     )
 
-    # 1. Filter out all sequences that dont share an family with the trait genera and are not marine
+    # 1. Filter out all sequences that dont share an order with the trait genera and are not marine
     df_ref = df_ref[
         (~df_ref.worms_genus.isna())
         & (df_ref.worms_ismarine)
-        & (df_ref.worms_family.isin(df_trait_genera.worms_family))
+        & (df_ref.worms_order.isin(df_trait_genera.worms_order))
     ]
 
     genus_cov_index = pd.MultiIndex.from_frame(df_trait_genera).union(

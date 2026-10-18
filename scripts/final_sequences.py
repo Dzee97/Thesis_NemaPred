@@ -61,14 +61,43 @@ def main():
     keep = mark_redundant(df_ref, tree_dist.data)
 
     df_ref = df_ref.loc[keep]
+    tree_dist = tree_dist.filter(list(df_ref.index))
+
+    worms_name = df_ref.worms_name.to_numpy()
+    worms_name_silhoette_coefs = np.asarray(
+        silhouette_samples(tree_dist.data, worms_name, metric="precomputed")
+    )
+
+    # is_genus = df_ref.worms_rank == "Genus"
+    # multiple_seqs = df_ref.groupby("worms_name").worms_name.transform("count") > 1
+    # species_multiple_seqs = ~is_genus & multiple_seqs
+
+    species_multiple_seqs = df_ref[df_ref.worms_rank == "Species"].groupby("worms_name").size() > 1
+    species_multiple_seqs = species_multiple_seqs[species_multiple_seqs].index.to_numpy()
+
+    keep = np.ones(len(df_ref), dtype=bool)
+    for species in species_multiple_seqs:
+        species_idx = np.flatnonzero(worms_name == species)
+        species_silhoette_coefs = worms_name_silhoette_coefs[species_idx]
+        species_remove = np.argsort(species_silhoette_coefs, descending=True)[1:]
+        species_remove_idx = species_idx[species_remove]
+        keep[species_remove_idx] = False
+
+    df_ref = df_ref.loc[keep]
+    tree_dist = tree_dist.filter(list(df_ref.index))
+
+    keep = mark_redundant(df_ref, tree_dist.data)
+
+    df_ref = df_ref.loc[keep]
+    tree_dist = tree_dist.filter(list(df_ref.index))
 
     is_genus = df_ref.worms_rank == "Genus"
-    multiple_seqs = df_ref.groupby("worms_name").worms_name.transform("count") > 1
-    unassigned_nums = df_ref[multiple_seqs].groupby("worms_name").cumcount() + 1
+    multiple_seqs = df_ref.groupby("worms_name").worms_name.transform("size") > 1
+    unassigned_nums = df_ref[(is_genus & multiple_seqs)].groupby("worms_name").cumcount() + 1
 
     tip_name = df_ref["worms_name"].copy()
     tip_name[is_genus] += " sp."
-    tip_name[multiple_seqs] += " " + unassigned_nums.astype(str)
+    tip_name[(is_genus & multiple_seqs)] += " " + unassigned_nums.astype(str)
 
     df_ref.to_csv(cfg.output_selection)
 
