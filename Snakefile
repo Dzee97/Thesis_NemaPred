@@ -115,11 +115,12 @@ rule filter_18s_sequences:
         dist_model = "tn93",
         model_gamma = 0.4,
         max_z_score = 3,
-        raxml_model = "GTR+G",
-        output_raxml_dir = RAXML_DATA_DIR
+        family_silhouette_margin = 0.3,
+        min_genera_per_family = 3
     output:
         output_fasta = PROCESSED_DATA_DIR / "Filtered_18S_aligned.fasta",
-        output_genus_cov = PROCESSED_DATA_DIR / "Filtered_18s_genus_coverage.csv"
+        output_genus_cov = PROCESSED_DATA_DIR / "Filtered_18s_genus_coverage.csv",
+        output_ref_stats = PROCESSED_DATA_DIR / "Filtered_18s_ref_stats.csv"
     script:
         "scripts/filter_sequences.py"
 
