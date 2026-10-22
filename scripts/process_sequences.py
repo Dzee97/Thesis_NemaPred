@@ -18,9 +18,10 @@ class Config:
     input_ref_fasta: Path
     input_ref_uc: Path
     input_otu_fasta: Path
-    input_out_fasta: Path
     output_parquet: Path
     worms_cache: Path
+
+    input_out_fasta: Path | None = None
 
 
 @dataclass
@@ -172,7 +173,7 @@ def main() -> None:
 
     # Intermediate structure for saving record data
     sequence_rows = []
-    alignment_length = 50000
+    alignment_length = -1
 
     # Try to load exsisting worms cache from disk
     worms_cache = load_worms_cache(cfg.worms_cache)
@@ -183,6 +184,9 @@ def main() -> None:
         enumerate(skbio.read(cfg.input_ref_fasta, format="fasta", constructor=skbio.RNA)),
         desc="Processing reference sequences",
     ):
+        if alignment_length == -1:
+            alignment_length = len(seq)
+
         sequence_rows.append(
             process_record(
                 seq=seq,
@@ -195,20 +199,21 @@ def main() -> None:
         if count % 1000 == 0:
             save_worms_cache(worms_cache, cfg.worms_cache)
 
-    # Now process the outgroup sequences
-    seq: skbio.RNA
-    for seq in tqdm(
-        skbio.read(cfg.input_out_fasta, format="fasta", constructor=skbio.RNA),
-        desc="Processing outgroup sequences",
-    ):
-        sequence_rows.append(
-            process_record(
-                seq=seq,
-                alignment_length=alignment_length,
-                seq_type="outgroup",
-                worms_cache=worms_cache,
+    # Now process the outgroup sequences if provided
+    if cfg.input_out_fasta is not None:
+        seq: skbio.RNA
+        for seq in tqdm(
+            skbio.read(cfg.input_out_fasta, format="fasta", constructor=skbio.RNA),
+            desc="Processing outgroup sequences",
+        ):
+            sequence_rows.append(
+                process_record(
+                    seq=seq,
+                    alignment_length=alignment_length,
+                    seq_type="outgroup",
+                    worms_cache=worms_cache,
+                )
             )
-        )
 
     save_worms_cache(worms_cache, cfg.worms_cache)
 

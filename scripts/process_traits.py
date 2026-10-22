@@ -8,7 +8,6 @@ from src.common import parse_config
 
 @dataclass
 class Config:
-    input_trait_genera: Path
     input_trait_data: Path
     output_trait_data: Path
     worms_cache: Path

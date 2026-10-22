@@ -13,7 +13,22 @@ from sklearn.metrics import silhouette_samples
 from src.common import parse_config
 
 TAXONOMY_COLS = ["worms_class", "worms_order", "worms_family", "worms_genus"]
-SORTING_COLS = ["worms_name", "clust_id", "length", "otu_coverage", "ambiguity_frac"]
+SORTING_COLS = [
+    *TAXONOMY_COLS,
+    "worms_name",
+    "clust_id",
+    "length",
+    "otu_coverage",
+    "ambiguity_frac",
+]
+STATS_COLS = [
+    *SORTING_COLS,
+    "family_silhouette",
+    "genus_median",
+    "support_count",
+    "support_members",
+    "tip_name",
+]
 
 
 @dataclass
@@ -22,6 +37,7 @@ class Config:
     input_parquet: Path
     input_trait_data: Path
     output_fasta: Path
+    output_outgroup: Path
     output_genus_cov: Path
     output_ref_stats: Path
 
@@ -29,15 +45,18 @@ class Config:
     min_length: int
     max_ambiguity: float
     otu_coverage: float
+    genus_length_frac: float
 
     # Molecular distance settings
     dist_model: str
     model_gamma: float
     max_z_score: float
 
+    # Redundancy pruning filter
+    prune_min_dist: float
+
     # Taxonomic outlier filter
     family_silhouette_margin: float
-    min_genera_per_family: int
 
 
 def create_compressed_alignment(df: pd.DataFrame) -> list[skbio.RNA]:
@@ -62,24 +81,31 @@ def add_coverage_column(genus_cov: pd.DataFrame, name: str, df_ref: pd.DataFrame
 
 
 def mark_redundant(
-    df_ref: pd.DataFrame,
-    dist_data: np.ndarray,
+    df_ref: pd.DataFrame, dist_data: np.ndarray, prune_min_dist: float
 ) -> tuple[np.ndarray, np.ndarray]:
     """Mark genus-level redundant sequences for removal.
 
-    A sequence can be absorbed when its nearest retained neighbour belongs to
-    the same genus and either:
-      - both have the same WoRMS name, in which case the lower genus-silhouette
-        sequence is removed; or
-      - one record is genus-level and the other species-level, in which case
-        the genus-level record is removed.
+    A sequence can be absorbed when its nearest retained neighbour belongs
+    to the same genus and either:
+
+      - both records have the same WoRMS name, in which case the
+        higher-quality sequence is retained; or
+
+      - one record is unresolved at genus level and the other is resolved
+        to species level, in which case the species-level record is retained.
 
     Different named species are never collapsed into each other.
+
+    Sequence quality is compared lexicographically using:
+      1. sequence length,
+      2. OTU coverage,
+      3. ambiguity fraction (lower is better).
 
     Returns
     -------
     keep
         Boolean mask of sequences retained by this pass.
+
     absorbed_by
         Positional index of the final surviving representative for every
         removed sequence, or -1 for retained sequences.
@@ -87,8 +113,9 @@ def mark_redundant(
     worms_genus = df_ref.worms_genus.to_numpy()
     worms_name = df_ref.worms_name.to_numpy()
     worms_rank = df_ref.worms_rank.to_numpy()
-
-    genus_silhouette = np.asarray(silhouette_samples(dist_data, worms_genus, metric="precomputed"))
+    length = df_ref.length.to_numpy()
+    otu_coverage = df_ref.otu_coverage.to_numpy()
+    ambiguity_frac = df_ref.ambiguity_frac.to_numpy()
 
     # Ignore self-distance when looking for the nearest retained neighbour.
     neighbour_dist = dist_data.copy()
@@ -100,33 +127,40 @@ def mark_redundant(
     while True:
         keep_idx = np.flatnonzero(keep)
 
+        # Nothing can be redundant if only one sequence remains (will not happen in practice)
+        if len(keep_idx) < 2:
+            break
+
         for idx in keep_idx:
             local_closest = np.nanargmin(neighbour_dist[idx, keep_idx])
-            closest_idx = keep_idx[local_closest]
+            closest_idx: np.intp = keep_idx[local_closest]
 
             if worms_genus[idx] != worms_genus[closest_idx]:
+                continue
+
+            if neighbour_dist[idx, closest_idx] > prune_min_dist:
                 continue
 
             if worms_name[idx] == worms_name[closest_idx]:
                 # Same taxon: keep the sequence that is more representative
                 # of its genus in the current distance geometry.
-                worst_idx = min(
+                best_idx = max(
                     idx,
                     closest_idx,
-                    key=lambda x: genus_silhouette[x],
+                    key=lambda x: (length[x], otu_coverage[x], -ambiguity_frac[x]),
                 )
-            elif worms_rank[idx] != worms_rank[closest_idx]:
+            elif {worms_rank[idx], worms_rank[closest_idx]} == {"Genus", "Species"}:
                 # Same genus, but one record is unresolved at genus level and
                 # the other is resolved to species level: keep the species-level
                 # record.
-                worst_idx = idx if worms_rank[idx] == "Genus" else closest_idx
+                best_idx = idx if worms_rank[idx] == "Species" else closest_idx
             else:
                 # Two different named species are both informative.
                 continue
 
-            absorb_idx = closest_idx if worst_idx == idx else idx
+            worst_idx = closest_idx if best_idx == idx else idx
             keep[worst_idx] = False
-            absorbed_by[worst_idx] = absorb_idx
+            absorbed_by[worst_idx] = best_idx
             break
         else:
             break
@@ -154,6 +188,7 @@ def mark_redundant(
 def remove_redundant(
     df_ref: pd.DataFrame,
     dist: skbio.DistanceMatrix,
+    prune_min_dist: float,
     on_tree: bool = False,
 ) -> tuple[pd.DataFrame, skbio.DistanceMatrix]:
     """Repeatedly remove redundant sequences until this distance view is stable.
@@ -173,7 +208,7 @@ def remove_redundant(
         else:
             dist_data = dist.data
 
-        keep, absorbed_by = mark_redundant(df_ref, dist_data)
+        keep, absorbed_by = mark_redundant(df_ref, dist_data, prune_min_dist)
 
         if keep.all():
             return df_ref, dist
@@ -204,6 +239,7 @@ def remove_redundancy_until_stable(
     dist: skbio.DistanceMatrix,
     genus_cov: pd.DataFrame,
     label: str,
+    prune_min_dist: float,
 ) -> tuple[pd.DataFrame, skbio.DistanceMatrix]:
     """Alternate molecular- and NJ-based redundancy pruning until stable."""
     cycle = 0
@@ -213,7 +249,7 @@ def remove_redundancy_until_stable(
         n_before = len(df_ref)
 
         print(f"Cycle {cycle} - Remove redundant on molecular distance")
-        df_ref, dist = remove_redundant(df_ref, dist, on_tree=False)
+        df_ref, dist = remove_redundant(df_ref, dist, prune_min_dist, on_tree=False)
         add_coverage_column(
             genus_cov,
             f"{label} I{cycle} - molecular genus redundancy",
@@ -221,7 +257,7 @@ def remove_redundancy_until_stable(
         )
 
         print(f"Cycle {cycle} - Remove redundant on NJ cophenet")
-        df_ref, dist = remove_redundant(df_ref, dist, on_tree=True)
+        df_ref, dist = remove_redundant(df_ref, dist, prune_min_dist, on_tree=True)
         add_coverage_column(
             genus_cov,
             f"{label} I{cycle} - NJ genus redundancy",
@@ -236,80 +272,73 @@ def remove_family_outliers(
     df_ref: pd.DataFrame,
     dist: skbio.DistanceMatrix,
     silhouette_margin: float,
-    min_genera_per_family: int,
 ) -> tuple[pd.DataFrame, skbio.DistanceMatrix]:
-    """Remove only strong sequence-level disagreements with genus and family.
+    """Remove strong family-placement outliers within genera.
 
-    A sequence is automatically removed only when:
-      1. its family is represented by enough genera to evaluate;
-      2. its family silhouette is negative;
-      3. its family silhouette is at least ``silhouette_margin`` below the
-         genus-balanced median for that family; and
-      4. its genus silhouette is also negative.
+    A sequence is removed when:
+      1. its family silhouette is negative, meaning that it is on average
+         closer to another family than to its own; and
+      2. its family silhouette is at least ``silhouette_margin`` below the
+         median family silhouette of sequences from the same genus.
 
-    The family baseline gives each genus equal weight, so well-sampled genera
-    do not dominate the expected family silhouette. The function also never
-    automatically removes every remaining sequence from a genus.
+    The comparison is therefore within genus. A genus whose sequences are
+    collectively unusual at family level is retained, while isolated sequences
+    that disagree strongly with the other representatives of their genus can
+    be removed.
 
-    Unlike redundancy pruning, support from these rejected outliers is not
-    transferred: the molecular evidence itself is being treated as unreliable.
+    The function never automatically removes every remaining sequence from
+    a genus. Support from rejected sequences is not transferred because these
+    sequences are treated as unreliable rather than redundant.
     """
     worms_family = df_ref.worms_family.to_numpy()
     worms_genus = df_ref.worms_genus.to_numpy()
 
     family_silhouette = np.asarray(
-        silhouette_samples(dist.data, worms_family, metric="precomputed")
-    )
-    genus_silhouette = np.asarray(silhouette_samples(dist.data, worms_genus, metric="precomputed"))
-
-    family_median = np.full(len(df_ref), np.nan)
-    family_testable = np.zeros(len(df_ref), dtype=bool)
-
-    for family in np.unique(worms_family):
-        family_idx = np.flatnonzero(worms_family == family)
-        family_genera = np.unique(worms_genus[family_idx])
-
-        if len(family_genera) < min_genera_per_family:
-            continue
-
-        # First summarize each genus, then summarize the family. This gives
-        # every genus one vote regardless of how many sequences it contains.
-        genus_medians = []
-        for genus in family_genera:
-            genus_idx = np.flatnonzero((worms_family == family) & (worms_genus == genus))
-            genus_medians.append(np.median(family_silhouette[genus_idx]))
-
-        family_median[family_idx] = np.median(genus_medians)
-        family_testable[family_idx] = True
-
-    family_outlier = (
-        family_testable
-        & (family_silhouette < 0)
-        & (family_silhouette < family_median - silhouette_margin)
+        silhouette_samples(
+            dist.data,
+            worms_family,
+            metric="precomputed",
+        )
     )
 
-    genus_size = df_ref.groupby("worms_genus")["worms_genus"].transform("size").to_numpy()
-    genus_outlier = (genus_size > 1) & (genus_silhouette < 0)
+    # Typical family-placement quality for each genus.
+    genus_median = np.full(len(df_ref), np.nan)
 
-    remove = family_outlier & genus_outlier
-
-    # Do not let an automatic taxonomy-based QC rule eliminate an entire genus.
-    rescued_genera = 0
     for genus in np.unique(worms_genus):
         genus_idx = np.flatnonzero(worms_genus == genus)
 
-        if len(genus_idx) > 0 and np.all(remove[genus_idx]):
-            best_idx = genus_idx[np.argmax(genus_silhouette[genus_idx])]
+        genus_median[genus_idx] = np.median(family_silhouette[genus_idx])
+
+    # Strong sequence-level disagreement with the family placement
+    # normally observed for this genus.
+    remove = family_silhouette < genus_median - silhouette_margin
+
+    flagged_count = remove.sum()
+
+    # Never let an automatic taxonomy-based QC rule eliminate
+    # every remaining representative of a genus.
+    rescued_genera = 0
+
+    for genus in np.unique(worms_genus):
+        genus_idx = np.flatnonzero(worms_genus == genus)
+
+        if np.all(remove[genus_idx]):
+            best_idx = genus_idx[np.argmax(family_silhouette[genus_idx])]
+
             remove[best_idx] = False
             rescued_genera += 1
 
     print(
-        f"Family/genus outliers flagged: {family_outlier.sum()}, "
-        f"removed: {remove.sum()}, kept: {(~remove).sum()}, "
+        f"Family outliers flagged: {flagged_count}, "
+        f"removed: {remove.sum()}, "
+        f"kept: {(~remove).sum()}, "
         f"genera safeguarded: {rescued_genera}"
     )
 
-    df_ref = df_ref.iloc[np.flatnonzero(~remove)].copy()
+    df_ref["family_silhouette"] = family_silhouette
+    df_ref["genus_median"] = genus_median
+
+    df_ref = df_ref.loc[~remove]
     dist = cast(skbio.DistanceMatrix, dist.filter(list(df_ref.index)))
 
     return df_ref, dist
@@ -373,21 +402,51 @@ def main() -> None:
     # ------------------------------------------------------------------
     df_ref = df_ref.sort_values(
         SORTING_COLS,
-        ascending=[True, True, False, False, True],
+        ascending=[True, True, True, True, True, True, False, False, True],
     )
     df_ref = df_ref.groupby(["worms_name", "clust_id"], sort=False, group_keys=False).head(1).copy()
     add_coverage_column(genus_cov, "WoRMS name x global cluster", df_ref)
 
     # ------------------------------------------------------------------
+    # 3. Remove genus-level sequences duplicated by species-level
+    # ------------------------------------------------------------------
+    df_ref["seq_bytes"] = df_ref.rna_seq.apply(lambda x: x.tobytes())
+    remove = []
+    for _, duplicate_group in df_ref.groupby("seq_bytes", sort=False):
+        if len(duplicate_group) < 2:
+            continue
+
+        has_species = (duplicate_group.worms_rank == "Species").any()
+        if not has_species:
+            continue
+
+        remove.extend(duplicate_group[duplicate_group.worms_rank == "Genus"].index.to_list())
+
+    df_ref = df_ref.drop(columns="seq_bytes")
+    df_ref = df_ref.drop(labels=remove)
+    add_coverage_column(genus_cov, "Genus-Species deduplication", df_ref)
+
+    # ------------------------------------------------------------------
+    # 3. Genus-relative length filter
+    # ------------------------------------------------------------------
+    df_ref = df_ref[
+        df_ref.length
+        >= cfg.genus_length_frac * df_ref.groupby("worms_genus").length.transform("max")
+    ].copy()
+    add_coverage_column(genus_cov, f"Length >= {cfg.genus_length_frac} x genus max", df_ref)
+
+    # ------------------------------------------------------------------
     # 4. Compute molecular distances and remove extreme global outliers
     # ------------------------------------------------------------------
     msa = skbio.TabularMSA(create_compressed_alignment(df_ref), index=df_ref.index)
-    dist = align_dists(
+    full_dist = align_dists(
         msa,
         metric=cfg.dist_model,
         gamma=cfg.model_gamma,
         shared_by_all=False,
     )
+
+    dist = full_dist
     dist.data[dist.data < 0.0] = 0.0
 
     dist_data = dist.data.copy()
@@ -414,10 +473,7 @@ def main() -> None:
     # 5. Compress redundant information before taxonomy-based QC
     # ------------------------------------------------------------------
     df_ref, dist = remove_redundancy_until_stable(
-        df_ref,
-        dist,
-        genus_cov,
-        label="Pre-family",
+        df_ref, dist, genus_cov, label="Pre-family", prune_min_dist=cfg.prune_min_dist
     )
 
     # ------------------------------------------------------------------
@@ -427,7 +483,6 @@ def main() -> None:
         df_ref,
         dist,
         silhouette_margin=cfg.family_silhouette_margin,
-        min_genera_per_family=cfg.min_genera_per_family,
     )
     add_coverage_column(genus_cov, "Family/genus outliers", df_ref)
 
@@ -435,10 +490,7 @@ def main() -> None:
     # redundant, so allow redundancy pruning to converge again. We deliberately
     # do not iterate the taxonomy-based outlier filter itself.
     df_ref, dist = remove_redundancy_until_stable(
-        df_ref,
-        dist,
-        genus_cov,
-        label="Post-family",
+        df_ref, dist, genus_cov, label="Post-family", prune_min_dist=cfg.prune_min_dist
     )
 
     # ------------------------------------------------------------------
@@ -449,10 +501,7 @@ def main() -> None:
     add_coverage_column(genus_cov, "Trait genera only", df_ref)
 
     df_ref, dist = remove_redundancy_until_stable(
-        df_ref,
-        dist,
-        genus_cov,
-        label="Trait only",
+        df_ref, dist, genus_cov, label="Trait only", prune_min_dist=cfg.prune_min_dist
     )
 
     # The surviving sequence itself is one unit of support in addition to all
@@ -460,35 +509,45 @@ def main() -> None:
     df_ref["support_count"] = df_ref.support_members.apply(len) + 1
 
     # ------------------------------------------------------------------
+    # 9. Give unique tip name for every surviving sequence
+    # ------------------------------------------------------------------
+    df_ref["tip_name"] = df_ref["worms_name"].copy()
+    df_ref.loc[df_ref.worms_rank == "Genus", "tip_name"] += " sp."
+
+    multiple_seqs = df_ref.groupby("worms_name").worms_name.transform("size") > 1
+    unassigned_nums = df_ref[multiple_seqs].groupby("worms_name").cumcount() + 1
+
+    df_ref.loc[multiple_seqs, "tip_name"] += " " + unassigned_nums.astype(str)
+
+    # ------------------------------------------------------------------
     # 8. Save diagnostics and candidate alignment
     # ------------------------------------------------------------------
-    ref_stats = df_ref[
-        [
-            *TAXONOMY_COLS,
-            *SORTING_COLS,
-            "support_count",
-            "support_members",
-        ]
-    ].copy()
+    ref_stats = df_ref[STATS_COLS].copy()
 
     # CSV-friendly representation of the supporting accessions.
     ref_stats["support_members"] = ref_stats.support_members.apply(
         lambda members: ";".join(map(str, members))
     )
 
-    # for output_path in [cfg.output_ref_stats, cfg.output_genus_cov, cfg.output_fasta]:
-    #    output_path.parent.mkdir(parents=True, exist_ok=True)
-
     ref_stats.to_csv(cfg.output_ref_stats)
     genus_cov.to_csv(cfg.output_genus_cov)
 
-    newick_compat = str.maketrans({" ": "_", "(": "", ")": ""})
-    aligned_sequences = create_compressed_alignment(df_ref)
+    df_outgroup = df[df.seq_type == "outgroup"].copy()
+    alignment_accessions = df_outgroup.index.to_list() + df_ref.index.to_list()
+    outgroup_names = df_outgroup.worms_name.to_list()
+    tip_names = outgroup_names + df_ref.tip_name.to_list()
 
+    df_alignment = df[["rna_seq", "msa_pos"]].loc[alignment_accessions]
+    aligned_sequences = create_compressed_alignment(df_alignment)
+
+    newick_compat = str.maketrans({" ": "_", "(": "", ")": ""})
     with open(cfg.output_fasta, "w") as f:
-        for (accession, row), seq in zip(df_ref.iterrows(), aligned_sequences):
-            taxon_name = row.worms_name.translate(newick_compat)
-            f.write(f">{accession}_{taxon_name}\n{seq}\n")
+        for tip_name, seq in zip(tip_names, aligned_sequences):
+            tip_name = tip_name.translate(newick_compat)
+            f.write(f">{tip_name}\n{seq}\n")
+
+    with open(cfg.output_outgroup, "w") as f:
+        f.write(",".join(name.translate(newick_compat) for name in outgroup_names))
 
 
 if __name__ == "__main__":
