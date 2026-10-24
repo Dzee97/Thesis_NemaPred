@@ -31,6 +31,52 @@ SEED = config["project"]["seed"]
 # 18S Pipeline
 # --------------------------------
 
+rule download_ncbi_data:
+    input:
+        input_trait_data = PROCESSED_DATA_DIR / "Trait_data.csv"
+    params:
+        worms_cache = PROCESSED_DATA_DIR / "WoRMS_cache.pkl",
+        entrez_cache = PROCESSED_DATA_DIR / "Entrez_cache.pkl"
+    output:
+        output_parquet = PROCESSED_DATA_DIR / "Sequence_store.parquet",
+        output_18S_fasta = PROCESSED_DATA_DIR / "NCBI_18S.fasta",
+        output_28S_fasta = PROCESSED_DATA_DIR / "NCBI_28S.fasta",
+        output_COI_template_fasta = PROCESSED_DATA_DIR / "NCBI_COI_template.fasta",
+        output_COI_fragment_fasta = PROCESSED_DATA_DIR / "NCBI_COI_fragment.fasta"
+    script:
+        "scripts/download_ncbi.py"
+
+rule align_18s_references:
+    input:
+        input_arb = RAW_18S_SILVA_DATA_DIR / "SILVA_144_SSURef_NR99_opt.arb",
+        input_fasta = PROCESSED_DATA_DIR / "NCBI_18S.fasta"
+    output:
+        output_fasta = PROCESSED_DATA_DIR / "NCBI_18S_aligned.fasta"
+    shell:
+        "sina -i {input.input_fasta} -r {input.input_arb} -o {output.output_fasta} --turn"
+
+rule align_28s_references:
+    input:
+        input_arb = RAW_18S_SILVA_DATA_DIR / "SILVA_138.2_LSURef_NR99_03_07_24_opt.arb",
+        input_fasta = PROCESSED_DATA_DIR / "NCBI_28S.fasta"
+    output:
+        output_fasta = PROCESSED_DATA_DIR / "NCBI_28S_aligned.fasta"
+    shell:
+        "sina -i {input.input_fasta} -r {input.input_arb} -o {output.output_fasta} --turn"
+
+rule align_coi_references:
+    input:
+        input_template_fasta = PROCESSED_DATA_DIR / "NCBI_COI_template.fasta",
+        input_fragment_fasta = PROCESSED_DATA_DIR / "NCBI_COI_fragment.fasta"
+    output:
+        output_template_fasta = PROCESSED_DATA_DIR / "NCBI_COI_template_aligned.fasta",
+        output_all_fasta = PROCESSED_DATA_DIR / "NCBI_COI_all_aligned.fasta"
+    shell:
+        """
+        mafft --localpair --maxiterate 1000 --preservecase --adjustdirection {input.input_template_fasta} > {output.output_template_fasta}
+        mafft --localpair --maxiterate 1000 --addfragments {input.input_fragment_fasta} --preservecase --adjustdirection {output.output_template_fasta} > {output.output_all_fasta}
+        """
+
 rule create_18s_otus_fasta:
     input:
         input_otus = RAW_18S_METABARCODING_DATA_DIR / "18S_Metabarcoding_OTU_table_Indonesia.xlsx"
