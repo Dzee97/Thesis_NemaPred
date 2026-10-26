@@ -73,18 +73,22 @@ def get_worms_taxonomy(queries: list[str], worms_cache: dict) -> dict[str, str] 
     return record
 
 
-def process_entrez_record(seq_record, query_gene, worms_cache, target_seq_type) -> dict | None:
+def process_entrez_record(
+    seq_record, query_gene, worms_cache, target_seq_type, trait_genera
+) -> dict | None:
     ncbi_species: str | None = seq_record.annotations.get("organism", None)
     if ncbi_species is None or not seq_record.seq.defined:
         return None
+
+    seq = seq_record.seq
 
     name_feature = None
     source_feature = None
     cds_feature = None
 
-    cds_codon_start = None
-    cds_product = None
-    cds_translation = None
+    voucher: str | None = None
+    cds_product: str | None = None
+    translation: str | None = None
 
     for feature in seq_record.features:
         if feature.type == "source":
@@ -110,9 +114,7 @@ def process_entrez_record(seq_record, query_gene, worms_cache, target_seq_type) 
             else qualifiers.get("gene", [None])[0]
         )
 
-    if source_feature is None:
-        voucher = None
-    else:
+    if source_feature is not None:
         qualifiers = source_feature.qualifiers
         source_species: str | None = qualifiers.get("organism", [None])[0]
         if source_species != ncbi_species:
@@ -126,16 +128,19 @@ def process_entrez_record(seq_record, query_gene, worms_cache, target_seq_type) 
             or qualifiers.get("strain", [None])[0]
         )
 
-    if voucher is None:
-        voucher = seq_record.id
-
     if cds_feature is not None:
         cds_gene = cds_feature.qualifiers.get("gene", [None])[0]
         if cds_gene != ncbi_gene:
             raise ValueError(f"Gene feature gene not equal to CDS gene: {ncbi_gene} vs {cds_gene}")
         cds_codon_start = cds_feature.qualifiers.get("codon_start", [None])[0]
         cds_product = cds_feature.qualifiers.get("product", [None])[0]
-        cds_translation: str = cds_feature.qualifiers.get("translation", [None])[0]
+
+        if cds_codon_start is not None:
+            seq = seq_record.seq[int(cds_codon_start) - 1 :]
+            seq = seq[: len(seq) // 3 * 3]
+
+            translation = str(seq.translate(table=5))
+
     elif query_gene == "COI":
         return None
 
@@ -161,12 +166,12 @@ def process_entrez_record(seq_record, query_gene, worms_cache, target_seq_type) 
         "ncbi_gene": ncbi_gene,
         "accession": seq_record.id,
         "description": seq_record.description,
-        "seq_length": len(seq_record.seq),
-        "seq": str(seq_record.seq),
-        "cds_codon_start": cds_codon_start,
+        "seq_length": len(seq),
+        "seq": str(seq),
         "cds_product": cds_product,
-        "cds_translation": cds_translation,
-        "cds_length": len(cds_translation) if cds_translation is not None else None,
+        "translation": translation,
+        "product_length": len(translation) if translation is not None else None,
+        "trait_genus": worms_record["genus"] in trait_genera,
     }
 
 
@@ -195,6 +200,7 @@ def main():
         "data/processed/Trait_data.csv", usecols=["worms_order", "worms_genus"]
     )
     search_taxa = df_trait_genera.worms_order.unique()
+    trait_genera = df_trait_genera.worms_genus.unique()
     all_records = []
 
     worms_cache = load_cache(cfg.worms_cache, "WoRMS")
@@ -286,7 +292,7 @@ def main():
                     for id, seq_record in zip(fetch_id_list, SeqIO.parse(fetch_handle, "genbank")):
                         entrez_cache[id] = seq_record
                         processed_record = process_entrez_record(
-                            seq_record, gene, worms_cache, seq_type
+                            seq_record, gene, worms_cache, seq_type, trait_genera
                         )
                         if processed_record is not None:
                             all_records.append(processed_record)
@@ -296,7 +302,7 @@ def main():
 
                 for seq_record in cached_records:
                     processed_record = process_entrez_record(
-                        seq_record, gene, worms_cache, seq_type
+                        seq_record, gene, worms_cache, seq_type, trait_genera
                     )
                     if processed_record is not None:
                         all_records.append(processed_record)
@@ -326,10 +332,6 @@ def main():
     df = df[df.worms_ismarine]
     df = df.set_index("accession")
 
-    trait_genera = df_trait_genera.worms_genus.unique()
-
-    df["trait_genus"] = df.worms_genus.isin(trait_genera)
-
     df.to_parquet(cfg.output_parquet, engine="pyarrow")
 
     with (
@@ -349,7 +351,7 @@ def main():
                     f = f_COI_template
                 else:
                     f = f_COI_fragment
-                seq = row.cds_translation
+                seq = row.translation
 
             f.write(f">{accession}\n{seq}\n")
 

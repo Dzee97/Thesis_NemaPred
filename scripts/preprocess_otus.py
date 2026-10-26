@@ -20,10 +20,7 @@ def main() -> None:
     df = pd.read_excel(cfg.input_otus, sheet_name="filtered_OTU_table", usecols=["sequence"])
 
     with open(cfg.output_fasta, "w") as f:
-        f.writelines(
-            f">OTU{idx}\n{skbio.DNA(seq).degap().transcribe()}\n"
-            for idx, seq in df.sequence.items()
-        )
+        f.writelines(f">OTU{idx}\n{skbio.DNA(seq).degap()}\n" for idx, seq in df.sequence.items())
 
 
 if __name__ == "__main__":
