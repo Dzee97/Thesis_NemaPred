@@ -32,7 +32,7 @@ class Config:
 def create_minimal_msa(
     seq_dict: dict[str, skbio.RNA | skbio.Protein],
     nuc_seqs: None | dict[str, skbio.DNA] = None,
-):
+) -> tuple[dict[str, int], np.ndarray]:
     alignment_length = -1
     unique_positions = set()
 
@@ -214,6 +214,55 @@ def plot_entropy_overlap_histogram(entropy_overlap_matrix, outfile, max_samples=
     plt.savefig(outfile)
 
 
+def plot_entropy_overlap_cdf(entropy_overlap_matrix, outfile, max_samples=100_000, seed=42):
+    """Creates a sampled Cumulative Distribution Function (CDF) plot
+
+    of the entropy-weighted overlap scores for unique pairwise sequence comparisons.
+    """
+    # 1. Get upper triangle indices (unique pairs, excluding the diagonal)
+    row_indices, col_indices = np.triu_indices_from(entropy_overlap_matrix, k=1)
+    total_pairs = len(row_indices)
+
+    # 2. Randomly sample if the dataset is large
+    if total_pairs > max_samples:
+        np.random.seed(seed)  # For reproducibility
+        sampled_idx = np.random.choice(total_pairs, size=max_samples, replace=False)
+        scores = entropy_overlap_matrix[row_indices[sampled_idx], col_indices[sampled_idx]]
+        print(f"Sampling {max_samples:,} pairs out of {total_pairs:,} total for CDF plotting.")
+    else:
+        scores = entropy_overlap_matrix[row_indices, col_indices]
+        print(f"Plotting all {total_pairs:,} pairs.")
+
+    # 3. Compute empirical CDF values
+    sorted_scores = np.sort(scores)
+    cdf_vals = np.arange(1, len(sorted_scores) + 1) / len(sorted_scores)
+
+    # 4. Set up and draw the plot
+    plt.figure(figsize=(8, 5))
+    plt.plot(
+        sorted_scores,
+        cdf_vals,
+        color="#2b5c8f",
+        linewidth=2.5,
+        label="Empirical CDF",
+    )
+
+    # 5. Styling and labels
+    plt.title(
+        f"Cumulative Distribution of Entropy Overlaps ({len(scores):,} sampled pairs)",
+        fontsize=12,
+    )
+    plt.xlabel("Entropy-Weighted Overlap Score (Sum of Bit Entropies)", fontsize=10)
+    plt.ylabel("Cumulative Proportion of Pairs", fontsize=10)
+
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.ylim(0, 1.05)
+    plt.tight_layout()
+    plt.legend(loc="lower right")
+
+    plt.savefig(outfile)
+
+
 def load_seq_dict(
     fasta_path: Path, constructor: type[skbio.DNA | skbio.RNA | skbio.Protein]
 ) -> dict[str, skbio.DNA | skbio.RNA | skbio.Protein]:
@@ -232,6 +281,16 @@ def get_species_balanced_accessions(df: pd.DataFrame, accessions: list[str]) -> 
     return non_species_accessions + first_species_accessions
 
 
+def filter_msa(
+    msa_index: dict[str, int], msa_matrix: np.ndarray, filter_ids: list[str]
+) -> tuple[dict[str, int], np.ndarray]:
+    filter_idx = [msa_index[id] for id in filter_ids]
+    new_msa_index = {id: i for i, id in enumerate(filter_ids)}
+    new_msa_matrix = msa_matrix[filter_idx]
+
+    return new_msa_index, new_msa_matrix
+
+
 def main() -> None:
     # Load snakemake or argparse arguments
     snakemake = globals().get("snakemake", None)
@@ -246,17 +305,17 @@ def main() -> None:
     seqs_18s = seqs_18s_ref | seqs_18s_otu
 
     ids_18s_ref = list(seqs_18s_ref.keys())
-    ids_18s_ref_species_balanced = get_species_balanced_accessions(df, ids_18s_ref)
+    ids_18s_ref_bal = get_species_balanced_accessions(df, ids_18s_ref)
     ids_18s_otu = list(seqs_18s_otu.keys())
 
     msa_18s_index, msa_18s_matrix = create_minimal_msa(seqs_18s)
+    msa_18s_ref_index, msa_18s_ref_matrix = filter_msa(msa_18s_index, msa_18s_matrix, ids_18s_ref)
+    _, msa_18s_ref_bal_matrix = filter_msa(msa_18s_index, msa_18s_matrix, ids_18s_ref_bal)
+    _, msa_18s_otu_matrix = filter_msa(msa_18s_index, msa_18s_matrix, ids_18s_otu)
 
-    msa_18s_ref_entropy, msa_18s_ref_coverage = calculate_column_entropies(
-        msa_18s_matrix[[msa_18s_index[id] for id in ids_18s_ref_species_balanced]]
-    )
-    msa_18s_otu_entropy, msa_18s_otu_coverage = calculate_column_entropies(
-        msa_18s_matrix[[msa_18s_index[id] for id in ids_18s_otu]]
-    )
+    msa_18s_ref_entropy, msa_18s_ref_coverage = calculate_column_entropies(msa_18s_ref_bal_matrix)
+    msa_18s_otu_entropy, msa_18s_otu_coverage = calculate_column_entropies(msa_18s_otu_matrix)
+
     plot_entropies(
         ref_entropies=msa_18s_ref_entropy,
         ref_coverage=msa_18s_ref_coverage,
@@ -265,33 +324,35 @@ def main() -> None:
         outfile="18s_entropy.png",
     )
 
-    valid_mask = msa_18s_matrix[[msa_18s_index[id] for id in ids_18s_ref]] != ord("-")
+    valid_mask = msa_18s_ref_matrix != ord("-")
     msa_18s_ref_matrix_entropy = valid_mask * msa_18s_ref_entropy
     msa_18s_ref_entropy_overlap = valid_mask @ msa_18s_ref_matrix_entropy.T
 
-    plot_entropy_overlap_histogram(msa_18s_ref_entropy_overlap, "18s_entropy_overlap.png")
+    plot_entropy_overlap_cdf(msa_18s_ref_entropy_overlap, "18s_entropy_overlap.png")
 
     # 28S
 
-    seqs_28s = load_seq_dict(cfg.input_28s_ref_fasta, skbio.RNA)
+    seqs_28s_ref = load_seq_dict(cfg.input_28s_ref_fasta, skbio.RNA)
 
-    msa_28s_index, msa_28s_matrix = create_minimal_msa(seqs_28s)
+    ids_28s_ref = list(seqs_28s_ref.keys())
+    ids_28s_ref_bal = get_species_balanced_accessions(df, ids_28s_ref)
 
-    ids_28s = list(seqs_28s.keys())
-    ids_28s_species_balanced = get_species_balanced_accessions(df, ids_28s)
+    msa_28s_ref_index, msa_28s_ref_matrix = create_minimal_msa(seqs_28s_ref)
+    _, msa_28s_ref_bal_matrix = filter_msa(msa_28s_ref_index, msa_28s_ref_matrix, ids_28s_ref_bal)
 
-    msa_28s_entropy, msa_28s_coverage = calculate_column_entropies(
-        msa_28s_matrix[[msa_28s_index[id] for id in ids_28s_species_balanced]]
-    )
+    msa_28s_ref_entropy, msa_28s_ref_coverage = calculate_column_entropies(msa_28s_ref_bal_matrix)
+
     plot_entropies(
-        ref_entropies=msa_28s_entropy, ref_coverage=msa_28s_coverage, outfile="28s_entropy.png"
+        ref_entropies=msa_28s_ref_entropy,
+        ref_coverage=msa_28s_ref_coverage,
+        outfile="28s_entropy.png",
     )
 
-    valid_mask = msa_28s_matrix != ord("-")
-    msa_28s_matrix_entropy = valid_mask * msa_28s_entropy
-    msa_28s_entropy_overlap = valid_mask @ msa_28s_matrix_entropy.T
+    valid_mask = msa_28s_ref_matrix != ord("-")
+    msa_28s_ref_matrix_entropy = valid_mask * msa_28s_ref_entropy
+    msa_28s_ref_entropy_overlap = valid_mask @ msa_28s_ref_matrix_entropy.T
 
-    plot_entropy_overlap_histogram(msa_28s_entropy_overlap, "28s_entropy_overlap.png")
+    plot_entropy_overlap_cdf(msa_28s_ref_entropy_overlap, "28s_entropy_overlap.png")
 
     # COI
 
@@ -300,18 +361,18 @@ def main() -> None:
     nuc_seqs_coi_otu = load_seq_dict(cfg.input_coi_otu_trimmed_fasta, skbio.DNA)
     nuc_seqs_coi = nuc_seqs_coi_ref | nuc_seqs_coi_otu
 
-    msa_coi_index, msa_coi_matrix = create_minimal_msa(prot_seqs_coi, nuc_seqs=nuc_seqs_coi)
-
     ids_coi_ref = list(nuc_seqs_coi_ref.keys())
-    ids_coi_ref_species_balanced = get_species_balanced_accessions(df, ids_coi_ref)
+    ids_coi_ref_bal = get_species_balanced_accessions(df, ids_coi_ref)
     ids_coi_otu = list(nuc_seqs_coi_otu.keys())
 
-    msa_coi_ref_entropy, msa_coi_ref_coverage = calculate_column_entropies(
-        msa_coi_matrix[[msa_coi_index[id] for id in ids_coi_ref_species_balanced]]
-    )
-    msa_coi_otu_entropy, msa_coi_otu_coverage = calculate_column_entropies(
-        msa_coi_matrix[[msa_coi_index[id] for id in ids_coi_otu]]
-    )
+    msa_coi_index, msa_coi_matrix = create_minimal_msa(prot_seqs_coi, nuc_seqs=nuc_seqs_coi)
+    msa_coi_ref_index, msa_coi_ref_matrix = filter_msa(msa_coi_index, msa_coi_matrix, ids_coi_ref)
+    _, msa_coi_ref_bal_matrix = filter_msa(msa_coi_index, msa_coi_matrix, ids_coi_ref_bal)
+    _, msa_coi_otu_matrix = filter_msa(msa_coi_index, msa_coi_matrix, ids_coi_otu)
+
+    msa_coi_ref_entropy, msa_coi_ref_coverage = calculate_column_entropies(msa_coi_ref_bal_matrix)
+    msa_coi_otu_entropy, msa_coi_otu_coverage = calculate_column_entropies(msa_coi_otu_matrix)
+
     plot_entropies(
         ref_entropies=msa_coi_ref_entropy,
         ref_coverage=msa_coi_ref_coverage,
@@ -320,11 +381,11 @@ def main() -> None:
         outfile="coi_entropy.png",
     )
 
-    valid_mask = msa_coi_matrix[[msa_coi_index[id] for id in ids_coi_ref]] != ord("-")
+    valid_mask = msa_coi_ref_matrix != ord("-")
     msa_coi_matrix_entropy = valid_mask * msa_coi_ref_entropy
     msa_coi_entropy_overlap = valid_mask @ msa_coi_matrix_entropy.T
 
-    plot_entropy_overlap_histogram(msa_coi_entropy_overlap, "coi_entropy_overlap.png")
+    plot_entropy_overlap_cdf(msa_coi_entropy_overlap, "coi_entropy_overlap.png")
 
     # Combine same voucher entropies
 
@@ -343,7 +404,45 @@ def main() -> None:
         + "_"
         + pivot_df["COI"].astype(str)
     )
-    pivot_df.set_index("joined_accession", inplace=True)
+    # pivot_df.set_index("joined_accession", inplace=True)
+
+    msa_18s_length = msa_18s_ref_matrix.shape[1]
+    msa_18s_joined_matrix = np.full((len(pivot_df), msa_18s_length), ord("-"), dtype=np.uint8)
+
+    insert_idx_18s = pivot_df["18S"].dropna().index.to_list()
+    insert_ids_18s = pivot_df["18S"].dropna().to_list()
+
+    _, insert_18s_matrix = filter_msa(msa_18s_ref_index, msa_18s_ref_matrix, insert_ids_18s)
+    msa_18s_joined_matrix[insert_idx_18s] = insert_18s_matrix
+
+    msa_28s_length = msa_28s_ref_matrix.shape[1]
+    msa_28s_joined_matrix = np.full((len(pivot_df), msa_28s_length), ord("-"), dtype=np.uint8)
+
+    insert_idx_28s = pivot_df["28S"].dropna().index.to_list()
+    insert_ids_28s = pivot_df["28S"].dropna().to_list()
+
+    _, insert_28s_matrix = filter_msa(msa_28s_ref_index, msa_28s_ref_matrix, insert_ids_28s)
+    msa_28s_joined_matrix[insert_idx_28s] = insert_28s_matrix
+
+    msa_coi_length = msa_coi_ref_matrix.shape[1]
+    msa_coi_joined_matrix = np.full((len(pivot_df), msa_coi_length), ord("-"), dtype=np.uint8)
+
+    insert_idx_coi = pivot_df["COI"].dropna().index.to_list()
+    insert_ids_coi = pivot_df["COI"].dropna().to_list()
+
+    _, insert_coi_matrix = filter_msa(msa_coi_ref_index, msa_coi_ref_matrix, insert_ids_coi)
+    msa_coi_joined_matrix[insert_idx_coi] = insert_coi_matrix
+
+    msa_joined_matrix = np.concatenate(
+        (msa_18s_joined_matrix, msa_28s_joined_matrix, msa_coi_joined_matrix), axis=1
+    )
+
+    valid_mask = msa_joined_matrix != ord("-")
+    joined_entropy = np.concatenate((msa_18s_ref_entropy, msa_28s_ref_entropy, msa_coi_ref_entropy))
+    msa_joined_matrix_entropy = valid_mask * joined_entropy
+    msa_joined_entropy_overlap = valid_mask @ msa_joined_matrix_entropy.T
+
+    plot_entropy_overlap_cdf(msa_joined_entropy_overlap, "joined_entropy_overlap.png")
 
     breakpoint()
 
