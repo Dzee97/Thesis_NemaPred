@@ -21,8 +21,9 @@ class Config:
     output_parquet: Path
     output_18S_fasta: Path
     output_28S_fasta: Path
-    output_COI_template_fasta: Path
-    output_COI_fragment_fasta: Path
+    output_COI_prot_template_fasta: Path
+    output_COI_prot_fragment_fasta: Path
+    output_COI_trimmed_fasta: Path
     worms_cache: Path
     entrez_cache: Path
 
@@ -87,7 +88,6 @@ def process_entrez_record(
     cds_feature = None
 
     voucher: str | None = None
-    cds_product: str | None = None
     translation: str | None = None
 
     for feature in seq_record.features:
@@ -133,7 +133,6 @@ def process_entrez_record(
         if cds_gene != ncbi_gene:
             raise ValueError(f"Gene feature gene not equal to CDS gene: {ncbi_gene} vs {cds_gene}")
         cds_codon_start = cds_feature.qualifiers.get("codon_start", [None])[0]
-        cds_product = cds_feature.qualifiers.get("product", [None])[0]
 
         if cds_codon_start is not None:
             seq = seq_record.seq[int(cds_codon_start) - 1 :]
@@ -166,11 +165,9 @@ def process_entrez_record(
         "ncbi_gene": ncbi_gene,
         "accession": seq_record.id,
         "description": seq_record.description,
-        "seq_length": len(seq),
         "seq": str(seq),
-        "cds_product": cds_product,
+        "seq_length": len(seq),
         "translation": translation,
-        "product_length": len(translation) if translation is not None else None,
         "trait_genus": worms_record["genus"] in trait_genera,
     }
 
@@ -332,28 +329,35 @@ def main():
     df = df[df.worms_ismarine]
     df = df.set_index("accession")
 
-    df.to_parquet(cfg.output_parquet, engine="pyarrow")
-
+    # Save sequences to fasta files
     with (
         open(cfg.output_18S_fasta, "w") as f_18S,
         open(cfg.output_28S_fasta, "w") as f_28S,
-        open(cfg.output_COI_template_fasta, "w") as f_COI_template,
-        open(cfg.output_COI_fragment_fasta, "w") as f_COI_fragment,
+        open(cfg.output_COI_prot_template_fasta, "w") as f_COI_template,
+        open(cfg.output_COI_prot_fragment_fasta, "w") as f_COI_fragment,
+        open(cfg.output_COI_trimmed_fasta, "w") as f_COI_trimmed,
     ):
         for accession, row in df.iterrows():
-            seq = row.seq
             if row.query_gene == "18S":
                 f = f_18S
             elif row.query_gene == "28S":
                 f = f_28S
             else:
-                if row.seq_length > 900:
-                    f = f_COI_template
-                else:
-                    f = f_COI_fragment
-                seq = row.translation
+                f = f_COI_trimmed
 
-            f.write(f">{accession}\n{seq}\n")
+                if row.seq_length > 900:
+                    f_prot = f_COI_template
+                else:
+                    f_prot = f_COI_fragment
+                f_prot.write(f">{accession}\n{row.translation}\n")
+
+            f.write(f">{accession}\n{row.seq}\n")
+
+    # Remove sequences before saving
+    df = df.drop(columns=["seq", "seq_length", "translation"])
+
+    # Save
+    df.to_parquet(cfg.output_parquet, engine="pyarrow")
 
 
 if __name__ == "__main__":

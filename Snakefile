@@ -43,8 +43,9 @@ rule download_ncbi_data:
         output_parquet = PROCESSED_DATA_DIR / "Sequence_store.parquet",
         output_18S_fasta = PROCESSED_DATA_DIR / "NCBI_18S.fasta",
         output_28S_fasta = PROCESSED_DATA_DIR / "NCBI_28S.fasta",
-        output_COI_template_fasta = PROCESSED_DATA_DIR / "NCBI_COI_template.fasta",
-        output_COI_fragment_fasta = PROCESSED_DATA_DIR / "NCBI_COI_fragment.fasta"
+        output_COI_prot_template_fasta = PROCESSED_DATA_DIR / "NCBI_COI_prot_template.fasta",
+        output_COI_prot_fragment_fasta = PROCESSED_DATA_DIR / "NCBI_COI_prot_fragment.fasta",
+        output_COI_trimmed_fasta = PROCESSED_DATA_DIR / "NCBI_COI_trimmed.fasta"
     script:
         "scripts/download_ncbi.py"
 
@@ -68,15 +69,15 @@ rule align_28s_references:
 
 rule align_coi_references:
     input:
-        input_template_fasta = PROCESSED_DATA_DIR / "NCBI_COI_template.fasta",
-        input_fragment_fasta = PROCESSED_DATA_DIR / "NCBI_COI_fragment.fasta"
+        input_template_fasta = PROCESSED_DATA_DIR / "NCBI_COI_prot_template.fasta",
+        input_fragment_fasta = PROCESSED_DATA_DIR / "NCBI_COI_prot_fragment.fasta"
     output:
-        output_template_fasta = PROCESSED_DATA_DIR / "NCBI_COI_template_aligned.fasta",
-        output_all_fasta = PROCESSED_DATA_DIR / "NCBI_COI_all_aligned.fasta"
+        output_template_fasta = PROCESSED_DATA_DIR / "NCBI_COI_prot_template_aligned.fasta",
+        output_all_fasta = PROCESSED_DATA_DIR / "NCBI_COI_prot_all_aligned.fasta"
     shell:
         """
         mafft --localpair --maxiterate 1000 --preservecase {input.input_template_fasta} > {output.output_template_fasta}
-        mafft --localpair --maxiterate 1000 --addfragments {input.input_fragment_fasta} --preservecase {output.output_template_fasta} > {output.output_all_fasta}
+        mafft --localpair --addfragments {input.input_fragment_fasta} --preservecase {output.output_template_fasta} > {output.output_all_fasta}
         """
 
 rule create_18s_otus_fasta:
@@ -98,12 +99,12 @@ rule align_18s_otus:
 
 rule build_coi_blast_db:
     input:
-        input_template_fasta = PROCESSED_DATA_DIR / "NCBI_COI_template.fasta",
-        input_fragment_fasta = PROCESSED_DATA_DIR / "NCBI_COI_fragment.fasta"
+        input_template_fasta = PROCESSED_DATA_DIR / "NCBI_COI_prot_template.fasta",
+        input_fragment_fasta = PROCESSED_DATA_DIR / "NCBI_COI_prot_fragment.fasta"
     params:
         prefix=PROCESSED_DATA_DIR / "NCBI_COI_blastdb"
     output:
-        output_fasta = PROCESSED_DATA_DIR / "NCBI_COI_all.fasta",
+        output_fasta = PROCESSED_DATA_DIR / "NCBI_COI_prot_all.fasta",
         output_pdb = PROCESSED_DATA_DIR / "NCBI_COI_blastdb.pdb",
         output_phr = PROCESSED_DATA_DIR / "NCBI_COI_blastdb.phr",
         output_pin = PROCESSED_DATA_DIR / "NCBI_COI_blastdb.pin",
@@ -122,13 +123,13 @@ rule create_coi_otus_fasta:
     input:
         input_otus = RAW_COI_METABARCODING_DATA_DIR / "COI_group_OTU_table_filtered_minSample_10000_minOTU_2_relative_0p001pct.xlsx"
     output:
-        output_fasta = PROCESSED_DATA_DIR / "OTUs_COI.fasta"
+        output_fasta = PROCESSED_DATA_DIR / "OTUs_COI_raw.fasta"
     script:
         "scripts/preprocess_otus.py"
 
 rule blastx_coi_otus:
     input:
-        input_fasta = PROCESSED_DATA_DIR / "OTUs_COI.fasta",
+        input_fasta = PROCESSED_DATA_DIR / "OTUs_COI_raw.fasta",
         input_pdb = PROCESSED_DATA_DIR / "NCBI_COI_blastdb.pdb",
         input_phr = PROCESSED_DATA_DIR / "NCBI_COI_blastdb.phr",
         input_pin = PROCESSED_DATA_DIR / "NCBI_COI_blastdb.pin",
@@ -152,25 +153,25 @@ rule blastx_coi_otus:
 
 rule translate_coi_otus:
     input:
-        input_fasta = PROCESSED_DATA_DIR / "OTUs_COI.fasta",
+        input_fasta = PROCESSED_DATA_DIR / "OTUs_COI_raw.fasta",
         input_blastx_results = PROCESSED_DATA_DIR / "OTUs_COI_blastx.tsv"
     params:
         min_query_coverage=0.9,
         frame_ambiguity_fraction=0.9,
     output:
-        output_protein_fasta = PROCESSED_DATA_DIR / "OTUs_COI_protein.fasta",
+        output_protein_fasta = PROCESSED_DATA_DIR / "OTUs_COI_prot.fasta",
         output_trimmed_fasta = PROCESSED_DATA_DIR / "OTUs_COI_trimmed.fasta",
     script:
         "scripts/translate_coi_otus.py"
 
 rule align_coi_otus:
     input:
-        input_ref_fasta = PROCESSED_DATA_DIR / "NCBI_COI_all_aligned.fasta",
-        input_otu_fasta = PROCESSED_DATA_DIR / "OTUs_COI_protein.fasta",
+        input_ref_fasta = PROCESSED_DATA_DIR / "NCBI_COI_prot_all_aligned.fasta",
+        input_otu_fasta = PROCESSED_DATA_DIR / "OTUs_COI_prot.fasta",
     output:
-        output_fasta = PROCESSED_DATA_DIR / "NCBI_COI_with_OTUs_aligned.fasta"
+        output_fasta = PROCESSED_DATA_DIR / "NCBI_COI_with_OTUs_prot_aligned.fasta"
     shell:
-        "mafft --auto --addfragments {input.input_otu_fasta} --keeplength --preservecase {input.input_ref_fasta} > {output.output_fasta}"
+        "mafft --6merpair --addfragments {input.input_otu_fasta} --preservecase {input.input_ref_fasta} > {output.output_fasta}"
 
 rule process_alignments:
     input:
@@ -178,7 +179,9 @@ rule process_alignments:
         input_18s_ref_fasta = PROCESSED_DATA_DIR / "NCBI_18S_aligned.fasta",
         input_18s_otu_fasta = PROCESSED_DATA_DIR / "OTUs_18S_aligned.fasta",
         input_28s_ref_fasta = PROCESSED_DATA_DIR / "NCBI_28S_aligned.fasta",
-        input_coi_ref_and_otu_fasta = PROCESSED_DATA_DIR / "NCBI_COI_with_OTUs_aligned.fasta"
+        input_coi_ref_and_otu_prot_fasta = PROCESSED_DATA_DIR / "NCBI_COI_with_OTUs_prot_aligned.fasta",
+        input_coi_ref_trimmed_fasta = PROCESSED_DATA_DIR / "NCBI_COI_trimmed.fasta",
+        input_coi_otu_trimmed_fasta = PROCESSED_DATA_DIR / "OTUs_COI_trimmed.fasta"
     output:
         output_parquet = PROCESSED_DATA_DIR / "Sequuence_store_aligned.parquet"
     script:
