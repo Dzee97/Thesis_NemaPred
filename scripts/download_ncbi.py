@@ -166,7 +166,7 @@ def process_entrez_record(
         "accession": seq_record.id,
         "description": seq_record.description,
         "seq": str(seq),
-        "seq_length": len(seq),
+        "length": len(seq),
         "translation": translation,
         "trait_genus": worms_record["genus"] in trait_genera,
     }
@@ -345,7 +345,7 @@ def main():
             else:
                 f = f_COI_trimmed
 
-                if row.seq_length > 900:
+                if row.length > 900:
                     f_prot = f_COI_template
                 else:
                     f_prot = f_COI_fragment
@@ -354,7 +354,7 @@ def main():
             f.write(f">{accession}\n{row.seq}\n")
 
     # Remove sequences before saving
-    df = df.drop(columns=["seq", "seq_length", "translation"])
+    df = df.drop(columns=["seq", "translation"])
 
     # Save
     df.to_parquet(cfg.output_parquet, engine="pyarrow")

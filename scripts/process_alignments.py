@@ -33,6 +33,7 @@ def create_minimal_msa(
     seq_dict: dict[str, skbio.RNA | skbio.Protein],
     nuc_seqs: None | dict[str, skbio.DNA] = None,
 ) -> tuple[dict[str, int], np.ndarray]:
+
     alignment_length = -1
     unique_positions = set()
 
@@ -48,69 +49,58 @@ def create_minimal_msa(
     new_position_map = np.full(alignment_length, -1, dtype=np.int32)
     new_position_map[unique_positions] = np.arange(len(unique_positions))
 
-    if nuc_seqs is None:
-        msa_index = {}
-        msa_matrix = np.full((len(seq_dict), len(unique_positions)), ord("-"), dtype=np.uint8)
+    msa_index = {}
 
-        for i, (accession, seq) in enumerate(seq_dict.items()):
-            msa_index[accession] = i
+    msa_length = len(unique_positions) if nuc_seqs is None else len(unique_positions) * 3
+    msa_matrix = np.full((len(seq_dict), msa_length), ord("-"), dtype=np.uint8)
 
-            non_gap_mask = ~seq.gaps()
-            new_positions = new_position_map[non_gap_mask]
+    for i, (accession, seq) in enumerate(seq_dict.items()):
+        msa_index[accession] = i
 
-            ungapped_seq = seq.degap().values.view(np.uint8)
-            msa_matrix[i, new_positions] = ungapped_seq
+        non_gap_mask = ~seq.gaps()
+        new_positions = new_position_map[non_gap_mask]
 
-        return msa_index, msa_matrix
-
-    else:
-        msa_index = {}
-        msa_matrix = np.full((len(seq_dict), len(unique_positions) * 3), ord("-"), dtype=np.uint8)
-
-        for i, (accession, prot_seq) in enumerate(seq_dict.items()):
-            msa_index[accession] = i
-
-            non_gap_mask = ~prot_seq.gaps()
-            new_positions = new_position_map[non_gap_mask]
-
+        if nuc_seqs is not None:
             new_positions = new_positions * 3
             new_positions = np.sort(
                 np.concatenate((new_positions, new_positions + 1, new_positions + 2))
             )
 
             nuc_seq = nuc_seqs[accession]
-            ungapped_seq = nuc_seq.degap().values.view(np.uint8)
-            msa_matrix[i, new_positions] = ungapped_seq
+        else:
+            nuc_seq = seq
 
-        return msa_index, msa_matrix
+        ungapped_seq = nuc_seq.degap().values.view(np.uint8)
+        msa_matrix[i, new_positions] = ungapped_seq
+
+    return msa_index, msa_matrix
 
 
-def calculate_column_entropies(msa_matrix):
-    valid_mask = msa_matrix != ord("-")
-    entropies = []
-    coverages = []
+def calculate_column_statistics(msa_matrix, min_nongap_elements=20, min_nongap_element_count=2):
+    nongap_mask = msa_matrix != ord("-")
+    col_coverage = np.sum(nongap_mask, axis=0) / len(msa_matrix)
+
+    col_entropies = []
 
     for col_idx in range(msa_matrix.shape[1]):
-        valid_elements = msa_matrix[valid_mask[:, col_idx], col_idx]
-        coverage = len(valid_elements) / len(msa_matrix)
-        coverages.append(coverage)
+        nongap_elements = msa_matrix[nongap_mask[:, col_idx], col_idx]
 
-        if coverage < 0.02 or len(valid_elements) < 20:
-            entropies.append(0.0)
+        if len(nongap_elements) < min_nongap_elements:
+            col_entropies.append(0.0)
             continue
 
-        symbols, counts = np.unique(valid_elements, return_counts=True)
+        symbols, counts = np.unique(nongap_elements, return_counts=True)
 
-        informative_mask = counts >= 2
+        informative_mask = counts >= min_nongap_element_count
         if len(symbols[informative_mask]) < 2:
-            entropies.append(0.0)
+            col_entropies.append(0.0)
             continue
 
-        probs = counts / len(valid_elements)
+        probs = counts / len(nongap_elements)
 
-        entropies.append(entropy(probs, base=2))
+        col_entropies.append(entropy(probs, base=2))
 
-    return np.array(entropies), np.array(coverages)
+    return np.array(col_entropies), col_coverage
 
 
 def plot_entropies(ref_entropies, ref_coverage, outfile, otu_entropies=None, otu_coverage=None):
@@ -125,8 +115,8 @@ def plot_entropies(ref_entropies, ref_coverage, outfile, otu_entropies=None, otu
 
     # 1. Ordered Line Plot
     ax1.scatter(
-        x[ref_entropies > 0],
-        ref_entropies[ref_entropies > 0],
+        x,
+        ref_entropies,
         c="steelblue",
         alpha=0.8,
         s=6.0,
@@ -134,8 +124,8 @@ def plot_entropies(ref_entropies, ref_coverage, outfile, otu_entropies=None, otu
     )
     if otu_entropies is not None:
         ax1.scatter(
-            x[otu_entropies > 0],
-            otu_entropies[otu_entropies > 0],
+            x,
+            otu_entropies,
             c="coral",
             alpha=0.8,
             s=6.0,
@@ -150,8 +140,8 @@ def plot_entropies(ref_entropies, ref_coverage, outfile, otu_entropies=None, otu
     # 2. Distribution Histogram
     # Automatically determine bins using 'auto', or use a fixed integer like 15
     ax2.scatter(
-        x[ref_coverage > 0],
-        ref_coverage[ref_coverage > 0],
+        x,
+        ref_coverage,
         c="steelblue",
         alpha=0.8,
         s=6.0,
@@ -159,8 +149,8 @@ def plot_entropies(ref_entropies, ref_coverage, outfile, otu_entropies=None, otu
     )
     if otu_coverage is not None:
         ax2.scatter(
-            x[otu_coverage > 0],
-            otu_coverage[otu_coverage > 0],
+            x,
+            otu_coverage,
             c="coral",
             alpha=0.8,
             s=6.0,
@@ -272,13 +262,43 @@ def load_seq_dict(
     }
 
 
-def get_species_balanced_accessions(df: pd.DataFrame, accessions: list[str]) -> list[str]:
+def get_species_balanced_accessions(
+    df: pd.DataFrame, accessions: list[str], groupby="worms_order"
+) -> dict[str, list[str]]:
     df = df.loc[accessions]
-    non_species_accessions = df[df.worms_rank != "Species"].index.to_list()
-    first_species_accessions = (
-        df[df.worms_rank == "Species"].groupby("worms_name", sort=False).head(1).index.to_list()
-    )
-    return non_species_accessions + first_species_accessions
+    group_accessions = {}
+
+    for worms_family, group in df.groupby(groupby):
+        non_species_accessions = group[group.worms_rank != "Species"].index.to_list()
+        first_species_accessions = (
+            group[group.worms_rank == "Species"]
+            .groupby("worms_name", sort=False)
+            .head(1)
+            .index.to_list()
+        )
+        group_accessions[worms_family] = non_species_accessions + first_species_accessions
+
+    return group_accessions
+
+
+def get_species_balanced_representatives(df: pd.DataFrame):
+    df = df.sort_values(by=[("length", gene) for gene in ("18S", "28S", "COI")], ascending=False)  # type: ignore
+
+    gene_rep_ids = {}
+    for gene in ("18S", "28S", "COI"):
+        df_gene = df[df.has_gene[gene]]
+
+        non_species_ids = df_gene[df_gene.worms_rank != "Species"].accession[gene].to_list()
+        species_rep_ids = (
+            df_gene[df_gene.worms_rank == "Species"]
+            .groupby("worms_name", sort=False)
+            .head(1)
+            .accession[gene]
+        ).to_list()
+
+        gene_rep_ids[gene] = non_species_ids + species_rep_ids
+
+    return gene_rep_ids
 
 
 def filter_msa(
@@ -289,6 +309,26 @@ def filter_msa(
     new_msa_matrix = msa_matrix[filter_idx]
 
     return new_msa_index, new_msa_matrix
+
+
+def calculate_global_and_grouped_column_statistics(msa_index, msa_matrix, group_ids):
+    all_ids = [id for group in group_ids.values() for id in group]
+    _, global_msa_matrix = filter_msa(msa_index, msa_matrix, all_ids)
+
+    global_entropy, global_coverage = calculate_column_statistics(global_msa_matrix)
+
+    group_index = {}
+    group_entropy = np.empty((len(group_ids), len(global_entropy)))
+    group_coverage = np.empty((len(group_ids), len(global_coverage)))
+
+    for i, (group, ids) in enumerate(group_ids.items()):
+        print(f"Processing {group}, size {len(ids)}")
+        group_index[group] = i
+
+        _, order_balanced_msa_18s = filter_msa(msa_index, msa_matrix, ids)
+        group_entropy[i], group_coverage[i] = calculate_column_statistics(order_balanced_msa_18s)
+
+    return global_entropy, global_coverage, group_index, group_entropy, group_coverage
 
 
 def main() -> None:
@@ -304,55 +344,20 @@ def main() -> None:
     seqs_18s_otu = load_seq_dict(cfg.input_18s_otu_fasta, skbio.RNA)
     seqs_18s = seqs_18s_ref | seqs_18s_otu
 
-    ids_18s_ref = list(seqs_18s_ref.keys())
-    ids_18s_ref_bal = get_species_balanced_accessions(df, ids_18s_ref)
-    ids_18s_otu = list(seqs_18s_otu.keys())
-
     msa_18s_index, msa_18s_matrix = create_minimal_msa(seqs_18s)
-    msa_18s_ref_index, msa_18s_ref_matrix = filter_msa(msa_18s_index, msa_18s_matrix, ids_18s_ref)
-    _, msa_18s_ref_bal_matrix = filter_msa(msa_18s_index, msa_18s_matrix, ids_18s_ref_bal)
-    _, msa_18s_otu_matrix = filter_msa(msa_18s_index, msa_18s_matrix, ids_18s_otu)
+    msa_18s_length = msa_18s_matrix.shape[1]
 
-    msa_18s_ref_entropy, msa_18s_ref_coverage = calculate_column_entropies(msa_18s_ref_bal_matrix)
-    msa_18s_otu_entropy, msa_18s_otu_coverage = calculate_column_entropies(msa_18s_otu_matrix)
-
-    plot_entropies(
-        ref_entropies=msa_18s_ref_entropy,
-        ref_coverage=msa_18s_ref_coverage,
-        otu_entropies=msa_18s_otu_entropy,
-        otu_coverage=msa_18s_otu_coverage,
-        outfile="18s_entropy.png",
-    )
-
-    valid_mask = msa_18s_ref_matrix != ord("-")
-    msa_18s_ref_matrix_entropy = valid_mask * msa_18s_ref_entropy
-    msa_18s_ref_entropy_overlap = valid_mask @ msa_18s_ref_matrix_entropy.T
-
-    plot_entropy_overlap_cdf(msa_18s_ref_entropy_overlap, "18s_entropy_overlap.png")
+    ids_18s_ref = list(seqs_18s_ref.keys())
+    ids_18s_otu = list(seqs_18s_otu.keys())
 
     # 28S
 
     seqs_28s_ref = load_seq_dict(cfg.input_28s_ref_fasta, skbio.RNA)
 
+    msa_28s_index, msa_28s_matrix = create_minimal_msa(seqs_28s_ref)
+    msa_28s_length = msa_28s_matrix.shape[1]
+
     ids_28s_ref = list(seqs_28s_ref.keys())
-    ids_28s_ref_bal = get_species_balanced_accessions(df, ids_28s_ref)
-
-    msa_28s_ref_index, msa_28s_ref_matrix = create_minimal_msa(seqs_28s_ref)
-    _, msa_28s_ref_bal_matrix = filter_msa(msa_28s_ref_index, msa_28s_ref_matrix, ids_28s_ref_bal)
-
-    msa_28s_ref_entropy, msa_28s_ref_coverage = calculate_column_entropies(msa_28s_ref_bal_matrix)
-
-    plot_entropies(
-        ref_entropies=msa_28s_ref_entropy,
-        ref_coverage=msa_28s_ref_coverage,
-        outfile="28s_entropy.png",
-    )
-
-    valid_mask = msa_28s_ref_matrix != ord("-")
-    msa_28s_ref_matrix_entropy = valid_mask * msa_28s_ref_entropy
-    msa_28s_ref_entropy_overlap = valid_mask @ msa_28s_ref_matrix_entropy.T
-
-    plot_entropy_overlap_cdf(msa_28s_ref_entropy_overlap, "28s_entropy_overlap.png")
 
     # COI
 
@@ -361,87 +366,79 @@ def main() -> None:
     nuc_seqs_coi_otu = load_seq_dict(cfg.input_coi_otu_trimmed_fasta, skbio.DNA)
     nuc_seqs_coi = nuc_seqs_coi_ref | nuc_seqs_coi_otu
 
+    msa_coi_index, msa_coi_matrix = create_minimal_msa(prot_seqs_coi, nuc_seqs=nuc_seqs_coi)
+    msa_coi_length = msa_coi_matrix.shape[1]
+
     ids_coi_ref = list(nuc_seqs_coi_ref.keys())
-    ids_coi_ref_bal = get_species_balanced_accessions(df, ids_coi_ref)
     ids_coi_otu = list(nuc_seqs_coi_otu.keys())
 
-    msa_coi_index, msa_coi_matrix = create_minimal_msa(prot_seqs_coi, nuc_seqs=nuc_seqs_coi)
-    msa_coi_ref_index, msa_coi_ref_matrix = filter_msa(msa_coi_index, msa_coi_matrix, ids_coi_ref)
-    _, msa_coi_ref_bal_matrix = filter_msa(msa_coi_index, msa_coi_matrix, ids_coi_ref_bal)
-    _, msa_coi_otu_matrix = filter_msa(msa_coi_index, msa_coi_matrix, ids_coi_otu)
-
-    msa_coi_ref_entropy, msa_coi_ref_coverage = calculate_column_entropies(msa_coi_ref_bal_matrix)
-    msa_coi_otu_entropy, msa_coi_otu_coverage = calculate_column_entropies(msa_coi_otu_matrix)
-
-    plot_entropies(
-        ref_entropies=msa_coi_ref_entropy,
-        ref_coverage=msa_coi_ref_coverage,
-        otu_entropies=msa_coi_otu_entropy,
-        otu_coverage=msa_coi_otu_coverage,
-        outfile="coi_entropy.png",
-    )
-
-    valid_mask = msa_coi_ref_matrix != ord("-")
-    msa_coi_matrix_entropy = valid_mask * msa_coi_ref_entropy
-    msa_coi_entropy_overlap = valid_mask @ msa_coi_matrix_entropy.T
-
-    plot_entropy_overlap_cdf(msa_coi_entropy_overlap, "coi_entropy_overlap.png")
-
-    # Combine same voucher entropies
+    # Combine same voucher rows
 
     df_copy = df.reset_index()
     df_copy.loc[df_copy.voucher.isna(), "voucher"] = (
         "NA_" + df_copy.loc[df_copy.voucher.isna(), "accession"]
     )
-    pivot_df = df_copy.pivot_table(
-        index=["ncbi_species", "voucher"], columns="query_gene", values="accession", aggfunc="first"
-    ).reset_index()
-
-    pivot_df["joined_accession"] = (
-        pivot_df["18S"].astype(str)
-        + "_"
-        + pivot_df["28S"].astype(str)
-        + "_"
-        + pivot_df["COI"].astype(str)
-    )
-    # pivot_df.set_index("joined_accession", inplace=True)
-
-    msa_18s_length = msa_18s_ref_matrix.shape[1]
-    msa_18s_joined_matrix = np.full((len(pivot_df), msa_18s_length), ord("-"), dtype=np.uint8)
-
-    insert_idx_18s = pivot_df["18S"].dropna().index.to_list()
-    insert_ids_18s = pivot_df["18S"].dropna().to_list()
-
-    _, insert_18s_matrix = filter_msa(msa_18s_ref_index, msa_18s_ref_matrix, insert_ids_18s)
-    msa_18s_joined_matrix[insert_idx_18s] = insert_18s_matrix
-
-    msa_28s_length = msa_28s_ref_matrix.shape[1]
-    msa_28s_joined_matrix = np.full((len(pivot_df), msa_28s_length), ord("-"), dtype=np.uint8)
-
-    insert_idx_28s = pivot_df["28S"].dropna().index.to_list()
-    insert_ids_28s = pivot_df["28S"].dropna().to_list()
-
-    _, insert_28s_matrix = filter_msa(msa_28s_ref_index, msa_28s_ref_matrix, insert_ids_28s)
-    msa_28s_joined_matrix[insert_idx_28s] = insert_28s_matrix
-
-    msa_coi_length = msa_coi_ref_matrix.shape[1]
-    msa_coi_joined_matrix = np.full((len(pivot_df), msa_coi_length), ord("-"), dtype=np.uint8)
-
-    insert_idx_coi = pivot_df["COI"].dropna().index.to_list()
-    insert_ids_coi = pivot_df["COI"].dropna().to_list()
-
-    _, insert_coi_matrix = filter_msa(msa_coi_ref_index, msa_coi_ref_matrix, insert_ids_coi)
-    msa_coi_joined_matrix[insert_idx_coi] = insert_coi_matrix
-
-    msa_joined_matrix = np.concatenate(
-        (msa_18s_joined_matrix, msa_28s_joined_matrix, msa_coi_joined_matrix), axis=1
+    pivot_df = (
+        df_copy.pivot_table(
+            index=[
+                "trait_genus",
+                "worms_class",
+                "worms_order",
+                "worms_family",
+                "worms_genus",
+                "worms_name",
+                "worms_rank",
+                "ncbi_species",
+                "voucher",
+            ],
+            columns="query_gene",
+            values=["accession", "length"],
+            aggfunc="first",
+        ).reset_index()
+        # .sort_values(by=[("length", gene) for gene in ("18S", "28S", "COI")], ascending=False)  # type: ignore
     )
 
-    valid_mask = msa_joined_matrix != ord("-")
-    joined_entropy = np.concatenate((msa_18s_ref_entropy, msa_28s_ref_entropy, msa_coi_ref_entropy))
-    msa_joined_matrix_entropy = valid_mask * joined_entropy
-    msa_joined_entropy_overlap = valid_mask @ msa_joined_matrix_entropy.T
+    has_gene: pd.DataFrame = ~pivot_df.accession.isna()  # type: ignore
+    has_gene.columns = pd.MultiIndex.from_product([["has_gene"], has_gene.columns])
 
+    pivot_df = pd.concat([pivot_df, has_gene], axis=1)
+
+    # Get species balanced representative accessions for all genes
+
+    gene_reps_ids = get_species_balanced_representatives(pivot_df)
+
+    # Combine into a single multi gene alignment
+
+    msa_joined_length = msa_18s_length + msa_28s_length + msa_coi_length
+    msa_joined_matrix = np.full((len(pivot_df), msa_joined_length), ord("-"), dtype=np.uint8)
+
+    joined_reps_entropy = np.zeros(msa_joined_length)
+    joined_reps_coverage = np.zeros(msa_joined_length)
+
+    for gene, start_col, end_col, msa_index, msa_matrix in (
+        ("18S", 0, msa_18s_length, msa_18s_index, msa_18s_matrix),
+        ("28S", msa_18s_length, msa_18s_length + msa_28s_length, msa_28s_index, msa_28s_matrix),
+        ("COI", msa_18s_length + msa_28s_length, msa_joined_length, msa_coi_index, msa_coi_matrix),
+    ):
+        insert_series = pivot_df[("accession", gene)].dropna()
+        insert_idx = insert_series.index.to_list()
+        insert_ids = insert_series.to_list()
+
+        _, insert_matrix = filter_msa(msa_index, msa_matrix, insert_ids)
+        msa_joined_matrix[insert_idx, start_col:end_col] = insert_matrix
+
+        # Calculate column entropies for gene representatives
+
+        _, msa_gene_reps = filter_msa(msa_index, msa_matrix, gene_reps_ids[gene])
+        gene_reps_entropy, gene_reps_coverage = calculate_column_statistics(msa_gene_reps)
+        joined_reps_entropy[start_col:end_col] = gene_reps_entropy
+        joined_reps_coverage[start_col:end_col] = gene_reps_coverage
+
+    nongap_mask = msa_joined_matrix != ord("-")
+    msa_joined_matrix_entropy = nongap_mask * joined_reps_entropy
+    msa_joined_entropy_overlap = nongap_mask @ msa_joined_matrix_entropy.T
+
+    plot_entropy_overlap_histogram(msa_joined_entropy_overlap, "joined_hist_entropy_overlap.png")
     plot_entropy_overlap_cdf(msa_joined_entropy_overlap, "joined_entropy_overlap.png")
 
     breakpoint()
