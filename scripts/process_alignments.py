@@ -478,10 +478,10 @@ def main() -> None:
         gene_reps_entropy[gene] = global_reps_entropy
         gene_info_gain[gene] = {}
 
-        for level in ["worms_class", "worms_order", "worms_family", "worms_genus"]:
+        for level in ["class", "order", "family", "genus"]:
             group_reps_entropy = []
             group_reps_weights = []
-            for group_name, group in gene_reps.groupby((level, "")):
+            for group_name, group in gene_reps.groupby((f"worms_{level}", "")):
                 group_rep_ids = group[("accession", gene)].to_list()
                 _, msa_group_reps = filter_msa(msa_index, msa_matrix, group_rep_ids)
                 group_reps_entropy.append(
@@ -520,6 +520,7 @@ def main() -> None:
             f"{gene} {level}": level_val
             for gene, gene_val in gene_info_gain.items()
             for level, level_val in gene_val.items()
+            if gene != "COI"
         },
         outfile="level_boxplot.png",
     )
