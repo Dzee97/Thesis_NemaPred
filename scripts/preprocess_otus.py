@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pandas as pd
 import skbio
-from src.common import parse_config
+from common import parse_config
 
 
 @dataclass

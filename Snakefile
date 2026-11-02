@@ -5,19 +5,9 @@ configfile: "config.yaml"
 DATA_DIR = Path(config["project"]["data_dir"])
 
 RAW_DATA_DIR = DATA_DIR / "raw"
-RAW_TRAIT_DATA_DIR = RAW_DATA_DIR / "Project_data_Nematode_traits"
-
-RAW_18S_METABARCODING_DATA_DIR = RAW_DATA_DIR / "Project_data_Nematode_traits" / "Metabarcoding_data" / "18S_metabarcoding"
-RAW_COI_METABARCODING_DATA_DIR = RAW_DATA_DIR / "Project_data_Nematode_traits" / "Metabarcoding_data" / "COI_metabarcoding"
-
-RAW_18S_NCBI_DATA_DIR = RAW_DATA_DIR / "Project_data_Nematode_traits" / "18S_references"
-RAW_18S_SILVA_DATA_DIR = RAW_DATA_DIR / "SILVA"
-
-RAW_COI_NCBI_DATA_DIR = RAW_DATA_DIR / "Project_data_Nematode_traits" / "COI_references"
-
+PROJECT_DATA_DIR = RAW_DATA_DIR / "Project_data_Nematode_traits"
+SILVA_DATA_DIR = RAW_DATA_DIR / "SILVA"
 PROCESSED_DATA_DIR = DATA_DIR / "processed"
-PROCESSED_18S_DATA_DIR = PROCESSED_DATA_DIR / "18S"
-PROCESSED_COI_DATA_DIR = PROCESSED_DATA_DIR / "COI"
 
 RAXML_DATA_DIR = PROCESSED_DATA_DIR / "raxml"
 PASTML_DATA_DIR = PROCESSED_DATA_DIR / "pastml"
@@ -33,6 +23,16 @@ SEED = config["project"]["seed"]
 
 # NEW METHOD
 
+rule process_trait_data:
+    input:
+        input_trait_data = PROJECT_DATA_DIR / "MarNemaFunDiv_nematodes_traits (1).xlsx",
+    params:
+        worms_cache = PROCESSED_DATA_DIR / "WoRMS_cache.pkl"
+    output:
+        output_trait_data = PROCESSED_DATA_DIR / "Trait_data.csv"
+    script:
+        "scripts/process_traits.py"
+
 rule download_ncbi_data:
     input:
         input_trait_data = PROCESSED_DATA_DIR / "Trait_data.csv"
@@ -40,7 +40,7 @@ rule download_ncbi_data:
         worms_cache = PROCESSED_DATA_DIR / "WoRMS_cache.pkl",
         entrez_cache = PROCESSED_DATA_DIR / "Entrez_cache.pkl"
     output:
-        output_parquet = PROCESSED_DATA_DIR / "Sequence_store.parquet",
+        output_metadata = PROCESSED_DATA_DIR / "NCBI_metadata.csv",
         output_18S_fasta = PROCESSED_DATA_DIR / "NCBI_18S.fasta",
         output_28S_fasta = PROCESSED_DATA_DIR / "NCBI_28S.fasta",
         output_COI_prot_template_fasta = PROCESSED_DATA_DIR / "NCBI_COI_prot_template.fasta",
@@ -51,21 +51,21 @@ rule download_ncbi_data:
 
 rule align_18s_references:
     input:
-        input_arb = RAW_18S_SILVA_DATA_DIR / "SILVA_144_SSURef_NR99_opt.arb",
+        input_arb = SILVA_DATA_DIR / "SILVA_144_SSURef_NR99_opt.arb",
         input_fasta = PROCESSED_DATA_DIR / "NCBI_18S.fasta"
     output:
         output_fasta = PROCESSED_DATA_DIR / "NCBI_18S_aligned.fasta"
     shell:
-        "sina -i {input.input_fasta} -r {input.input_arb} -o {output.output_fasta}"
+        "sina -i {input.input_fasta} -r {input.input_arb} -o {output.output_fasta} --fasta-write-dna"
 
 rule align_28s_references:
     input:
-        input_arb = RAW_18S_SILVA_DATA_DIR / "SILVA_138.2_LSURef_NR99_03_07_24_opt.arb",
+        input_arb = SILVA_DATA_DIR / "SILVA_138.2_LSURef_NR99_03_07_24_opt.arb",
         input_fasta = PROCESSED_DATA_DIR / "NCBI_28S.fasta"
     output:
         output_fasta = PROCESSED_DATA_DIR / "NCBI_28S_aligned.fasta"
     shell:
-        "sina -i {input.input_fasta} -r {input.input_arb} -o {output.output_fasta}"
+        "sina -i {input.input_fasta} -r {input.input_arb} -o {output.output_fasta} --fasta-write-dna"
 
 rule align_coi_references:
     input:
@@ -82,7 +82,7 @@ rule align_coi_references:
 
 rule create_18s_otus_fasta:
     input:
-        input_otus = RAW_18S_METABARCODING_DATA_DIR / "18S_Metabarcoding_OTU_table_Indonesia.xlsx"
+        input_otus = PROJECT_DATA_DIR / "Metabarcoding_data" / "18S_metabarcoding" /"18S_Metabarcoding_OTU_table_Indonesia.xlsx"
     output:
         output_fasta = PROCESSED_DATA_DIR / "OTUs_18S.fasta"
     script:
@@ -90,12 +90,12 @@ rule create_18s_otus_fasta:
 
 rule align_18s_otus:
      input:
-         input_arb = RAW_18S_SILVA_DATA_DIR / "SILVA_144_SSURef_NR99_opt.arb",
+         input_arb = SILVA_DATA_DIR / "SILVA_144_SSURef_NR99_opt.arb",
          input_fasta = PROCESSED_DATA_DIR / "OTUs_18S.fasta"
      output:
          output_fasta = PROCESSED_DATA_DIR / "OTUs_18S_aligned.fasta"
      shell:
-         "sina -i {input.input_fasta} -r {input.input_arb} -o {output.output_fasta}"
+         "sina -i {input.input_fasta} -r {input.input_arb} -o {output.output_fasta} --fasta-write-dna"
 
 rule build_coi_blast_db:
     input:
@@ -121,7 +121,7 @@ rule build_coi_blast_db:
 
 rule create_coi_otus_fasta:
     input:
-        input_otus = RAW_COI_METABARCODING_DATA_DIR / "COI_group_OTU_table_filtered_minSample_10000_minOTU_2_relative_0p001pct.xlsx"
+        input_otus = PROJECT_DATA_DIR / "Metabarcoding_data" / "COI_metabarcoding" / "COI_group_OTU_table_filtered_minSample_10000_minOTU_2_relative_0p001pct.xlsx"
     output:
         output_fasta = PROCESSED_DATA_DIR / "OTUs_COI_raw.fasta"
     script:
@@ -175,7 +175,7 @@ rule align_coi_otus:
 
 rule process_alignments:
     input:
-        input_parquet = PROCESSED_DATA_DIR / "Sequence_store.parquet",
+        input_metadata = PROCESSED_DATA_DIR / "NCBI_metadata.csv",
         input_18s_ref_fasta = PROCESSED_DATA_DIR / "NCBI_18S_aligned.fasta",
         input_18s_otu_fasta = PROCESSED_DATA_DIR / "OTUs_18S_aligned.fasta",
         input_28s_ref_fasta = PROCESSED_DATA_DIR / "NCBI_28S_aligned.fasta",

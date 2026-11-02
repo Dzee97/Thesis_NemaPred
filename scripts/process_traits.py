@@ -2,8 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
-from process_sequences import get_worms_taxonomy, load_worms_cache
-from src.common import parse_config
+from common import get_worms_taxonomy, load_cache, parse_config, save_cache
 
 
 @dataclass
@@ -19,7 +18,7 @@ def main():
 
     df_trait_data = pd.read_excel(cfg.input_trait_data)
 
-    worms_cache = load_worms_cache(cfg.worms_cache)
+    worms_cache = load_cache(cfg.worms_cache, "WoRMS")
 
     worms_genus = []
     worms_family = []
@@ -57,6 +56,8 @@ def main():
     )
 
     df_trait_data.to_csv(cfg.output_trait_data)
+
+    save_cache(worms_cache, cfg.worms_cache)
 
 
 if __name__ == "__main__":

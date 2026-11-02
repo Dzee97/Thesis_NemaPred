@@ -1,24 +1,17 @@
-import pickle
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
-from urllib.parse import quote
 
-import numpy as np
 import pandas as pd
-import pyarrow as pa
-import requests
-import skbio
 from Bio import Entrez, SeqIO
 from Bio.Entrez.Parser import DictionaryElement
-from src.common import parse_config
-from tqdm import tqdm
+from common import get_worms_taxonomy, load_cache, parse_config, save_cache
 
 
 @dataclass
 class Config:
     input_trait_data: Path
-    output_parquet: Path
+    output_metadata: Path
     output_18S_fasta: Path
     output_28S_fasta: Path
     output_COI_prot_template_fasta: Path
@@ -26,52 +19,6 @@ class Config:
     output_COI_trimmed_fasta: Path
     worms_cache: Path
     entrez_cache: Path
-
-
-def get_worms_taxonomy(queries: list[str], worms_cache: dict) -> dict[str, str] | None:
-    worms_url = "https://www.marinespecies.org/rest"
-    params = {"like": "false", "marine_only": "false"}
-
-    def query_worms(query: str):
-        if query in worms_cache:
-            return worms_cache[query]
-
-        url = f"{worms_url}/AphiaRecordsByName/{quote(query)}"
-
-        response = requests.get(url, params=params)
-        if response.status_code in [404, 204]:
-            worms_cache[query] = None
-            return None
-
-        records: list[dict] = response.json()
-        if len(records) > 1:
-            records = [r for r in records if r["status"] == "accepted"]
-        if len(records) > 1:
-            records = [r for r in records if r["rank"] in ["Genus", "Species"]]
-        if len(records) > 1:
-            records = [r for r in records if r["phylum"] == "Nematoda"]
-        if len(records) > 1:
-            records = records[:1]
-            # raise RuntimeError(f"Multiple appected nematode WoRMS records found for: {query}")
-
-        record = records[0] if records else None
-        worms_cache[query] = record
-
-        return record
-
-    record = None
-    for query in queries:
-        record = query_worms(query)
-        if record is not None:
-            if (
-                record["valid_name"] is not None
-                and record["scientificname"] != record["valid_name"]
-            ):
-                new_record = query_worms(record["valid_name"])
-                record = new_record if new_record is not None else record
-            break
-
-    return record
 
 
 def process_entrez_record(
@@ -170,21 +117,6 @@ def process_entrez_record(
         "translation": translation,
         "trait_genus": worms_record["genus"] in trait_genera,
     }
-
-
-def load_cache(path: Path, name: str) -> dict:
-    if path.exists():
-        with open(path, "rb") as f:
-            cache = pickle.load(f)
-            print(f"Loaded {name} cache from disk with {len(cache)} entries")
-            return cache
-
-    return {}
-
-
-def save_cache(cache: dict, path: Path) -> None:
-    with open(path, "wb") as f:
-        pickle.dump(cache, f)
 
 
 def main():
@@ -307,8 +239,7 @@ def main():
                 save_cache(worms_cache, cfg.worms_cache)
 
     # --- Post-processing and pairing (same as before) ---
-    pa_table = pa.Table.from_pylist(all_records)
-    df: pd.DataFrame = pa_table.to_pandas(types_mapper=pd.ArrowDtype)
+    df = pd.DataFrame.from_records(all_records)
 
     df = df.sort_values(
         [
@@ -357,7 +288,7 @@ def main():
     df = df.drop(columns=["seq", "translation"])
 
     # Save
-    df.to_parquet(cfg.output_parquet, engine="pyarrow")
+    df.to_csv(cfg.output_metadata)
 
 
 if __name__ == "__main__":

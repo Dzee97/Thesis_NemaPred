@@ -1,25 +1,18 @@
-import pickle
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
-from urllib.parse import quote
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import pyarrow as pa
-import requests
 import skbio
-from scipy.sparse import csr_matrix, find
-from scipy.sparse.csgraph import connected_components
+from common import parse_config
 from scipy.stats import entropy
-from src.common import parse_config
 from tqdm import tqdm
 
 
 @dataclass
 class Config:
-    input_parquet: Path
+    input_metadata: Path
     input_18s_ref_fasta: Path
     input_18s_otu_fasta: Path
     input_28s_ref_fasta: Path
@@ -99,6 +92,100 @@ def calculate_column_entropies(msa_matrix, min_nongap_elements=20, min_nongap_el
         col_entropies.append(entropy(probs, base=2))
 
     return np.array(col_entropies)
+
+
+def calculate_species_balanced_column_entropies(
+    df: pd.DataFrame,
+    msa_matrix: np.ndarray,
+    min_observations=50,
+    min_global_entropy=0.25,
+    min_split_size=3,
+):
+    def calculate_entropy(elements):
+        _, counts = np.unique(elements, return_counts=True)
+        probs = counts / len(elements)
+        return entropy(probs, base=2)
+
+    msa_length = msa_matrix.shape[1]
+    col_global_entropy = np.full(msa_length, np.nan)
+
+    tax_levels = ["class", "order", "family", "genus"]
+    col_infogain = {l: np.full(msa_length, np.nan) for l in tax_levels}
+    col_splitinfo = {l: np.full(msa_length, np.nan) for l in tax_levels}
+
+    for col_idx in tqdm(range(msa_length)):
+        col_vals = msa_matrix[:, col_idx]
+        nondegen_mask = np.isin(col_vals, [ord(c) for c in ["A", "C", "G", "T"]])
+
+        df_nondegen = df[nondegen_mask]
+        is_species = df_nondegen.worms_rank == "Species"
+
+        rep_mask = np.zeros_like(nondegen_mask)
+        rep_mask[df_nondegen.index.to_numpy()] = ~is_species.to_numpy()
+
+        for _, sp_rows in df_nondegen[is_species].groupby("worms_name", sort=False):
+            sp_col_vals = col_vals[sp_rows.index.to_numpy()]
+
+            vals, counts = np.unique(sp_col_vals, return_counts=True)
+            max_idx = np.argmax(counts)
+            max_val = vals[max_idx]
+
+            rep_sp_idx = np.argmax(sp_col_vals == max_val)
+            rep_all_idx = sp_rows.index[int(rep_sp_idx)]
+
+            rep_mask[rep_all_idx] = True
+
+        if np.sum(rep_mask) < min_observations:
+            continue
+
+        df_rep = df[rep_mask]
+        global_entropy = calculate_entropy(col_vals[rep_mask])
+
+        if global_entropy < min_global_entropy:
+            continue
+
+        for i, level in enumerate(tax_levels):
+            group_entropies = []
+            group_weights = []
+
+            other_bucket = []
+
+            for _, group_rows in df_rep.groupby(f"worms_{level}", sort=False):
+                if i > 0 and len(group_rows) < min_split_size:
+                    other_bucket.extend(group_rows.index.to_list())
+                    continue
+
+                group_idx = group_rows.index.to_numpy()
+                group_entropies.append(calculate_entropy(col_vals[group_idx]))
+                group_weights.append(len(group_rows) / len(df_rep))
+
+            if i > 1 and len(other_bucket) > 0:
+                tax_step = 1
+                j = i - tax_step
+                while j >= 0 and len(other_bucket) > 0:
+                    higher_level = tax_levels[j]
+                    df_other = df_rep.loc[other_bucket]
+                    other_bucket = []
+                    for _, group_rows in df_other.groupby(f"worms_{higher_level}", sort=False):
+                        if j > 0 and len(group_rows) < min_split_size:
+                            other_bucket.extend(group_rows.index.to_list())
+                            continue
+
+                        group_idx = group_rows.index.to_numpy()
+                        group_entropies.append(calculate_entropy(col_vals[group_idx]))
+                        group_weights.append(len(group_rows) / len(df_rep))
+
+                    tax_step += 1
+                    j = i - tax_step
+
+            level_entropy = np.average(group_entropies, weights=group_weights)
+
+            col_infogain[level][col_idx] = global_entropy - level_entropy
+            col_splitinfo[level][col_idx] = entropy(group_weights, base=2)
+
+        col_global_entropy[col_idx] = global_entropy
+
+    return col_global_entropy, col_infogain, col_splitinfo
 
 
 def plot_entropies(ref_entropies, ref_coverage, outfile, otu_entropies=None, otu_coverage=None):
@@ -289,31 +376,12 @@ def plot_entropy_boxplots(entropy_dict, outfile, figsize=(10, 6)):
 
 
 def load_seq_dict(
-    fasta_path: Path, constructor: type[skbio.DNA | skbio.RNA | skbio.Protein]
+    fasta_path: Path, constructor: type[skbio.DNA | skbio.Protein]
 ) -> dict[str, skbio.DNA | skbio.RNA | skbio.Protein]:
     return {
         seq.metadata["id"]: seq
         for seq in skbio.read(fasta_path, format="fasta", constructor=constructor)
     }
-
-
-def get_species_balanced_accessions(
-    df: pd.DataFrame, accessions: list[str], groupby="worms_order"
-) -> dict[str, list[str]]:
-    df = df.loc[accessions]
-    group_accessions = {}
-
-    for worms_family, group in df.groupby(groupby):
-        non_species_accessions = group[group.worms_rank != "Species"].index.to_list()
-        first_species_accessions = (
-            group[group.worms_rank == "Species"]
-            .groupby("worms_name", sort=False)
-            .head(1)
-            .index.to_list()
-        )
-        group_accessions[worms_family] = non_species_accessions + first_species_accessions
-
-    return group_accessions
 
 
 def add_species_balanced_representatives(df: pd.DataFrame):
@@ -335,7 +403,7 @@ def add_species_balanced_representatives(df: pd.DataFrame):
         gene_reps[gene] = is_rep
 
     df_reps = pd.DataFrame.from_dict(gene_reps)
-    df_reps = df_reps.fillna(False)
+    df_reps = df_reps.fillna(0).astype(bool)
     df_reps.columns = pd.MultiIndex.from_product([["is_rep"], df_reps.columns])
 
     return pd.concat([df, df_reps], axis=1)
@@ -375,12 +443,12 @@ def main() -> None:
     snakemake = globals().get("snakemake", None)
     cfg = parse_config(Config, snakemake)
 
-    df = pd.read_parquet(cfg.input_parquet, engine="pyarrow", dtype_backend="pyarrow")
+    df = pd.read_csv(cfg.input_metadata, index_col="accession")
 
     # 18S
 
-    seqs_18s_ref = load_seq_dict(cfg.input_18s_ref_fasta, skbio.RNA)
-    seqs_18s_otu = load_seq_dict(cfg.input_18s_otu_fasta, skbio.RNA)
+    seqs_18s_ref = load_seq_dict(cfg.input_18s_ref_fasta, skbio.DNA)
+    seqs_18s_otu = load_seq_dict(cfg.input_18s_otu_fasta, skbio.DNA)
     seqs_18s = seqs_18s_ref | seqs_18s_otu
 
     msa_18s_index, msa_18s_matrix = create_minimal_msa(seqs_18s_ref)
@@ -391,7 +459,7 @@ def main() -> None:
 
     # 28S
 
-    seqs_28s_ref = load_seq_dict(cfg.input_28s_ref_fasta, skbio.RNA)
+    seqs_28s_ref = load_seq_dict(cfg.input_28s_ref_fasta, skbio.DNA)
 
     msa_28s_index, msa_28s_matrix = create_minimal_msa(seqs_28s_ref)
     msa_28s_length = msa_28s_matrix.shape[1]
@@ -443,22 +511,19 @@ def main() -> None:
 
     pivot_df = pd.concat([pivot_df, has_gene], axis=1)
 
-    # Get species balanced representative accessions for all genes
-
-    pivot_df = add_species_balanced_representatives(pivot_df)
-
     # Combine into a single multi gene alignment
 
     msa_joined_length = msa_18s_length + msa_28s_length + msa_coi_length
     msa_joined_matrix = np.full((len(pivot_df), msa_joined_length), ord("-"), dtype=np.uint8)
 
-    gene_reps_entropy = {}
-    gene_info_gain = {}
+    start_col_18s, end_col_18s = 0, msa_18s_length
+    start_col_28s, end_col_28s = msa_18s_length, msa_18s_length + msa_28s_length
+    start_col_coi, end_col_coi = msa_18s_length + msa_28s_length, msa_joined_length
 
     for gene, start_col, end_col, msa_index, msa_matrix in (
-        ("18S", 0, msa_18s_length, msa_18s_index, msa_18s_matrix),
-        ("28S", msa_18s_length, msa_18s_length + msa_28s_length, msa_28s_index, msa_28s_matrix),
-        ("COI", msa_18s_length + msa_28s_length, msa_joined_length, msa_coi_index, msa_coi_matrix),
+        ("18S", start_col_18s, end_col_18s, msa_18s_index, msa_18s_matrix),
+        ("28S", start_col_28s, end_col_28s, msa_28s_index, msa_28s_matrix),
+        ("COI", start_col_coi, end_col_coi, msa_coi_index, msa_coi_matrix),
     ):
         insert_series = pivot_df[("accession", gene)].dropna()
         insert_idx = insert_series.index.to_list()
@@ -467,63 +532,94 @@ def main() -> None:
         _, insert_matrix = filter_msa(msa_index, msa_matrix, insert_ids)
         msa_joined_matrix[insert_idx, start_col:end_col] = insert_matrix
 
-        # Calculate column entropies for gene representatives
+    col_global_entropy, col_infogain, col_splitinfo = calculate_species_balanced_column_entropies(
+        pivot_df, msa_joined_matrix
+    )
 
-        gene_reps = pivot_df[pivot_df[("is_rep", gene)]]
+    gene_gainratio = {}
+    for gene, start_col, end_col in (
+        ("18S", start_col_18s, end_col_18s),
+        ("28S", start_col_28s, end_col_28s),
+        ("COI", start_col_coi, end_col_coi),
+    ):
+        for level, infogain in col_infogain.items():
+            gene_global_entropy = col_global_entropy[start_col:end_col]
+            gene_infogain = infogain[start_col:end_col]
+            gene_splitinfo = col_splitinfo[level][start_col:end_col]
 
-        global_rep_ids = gene_reps[("accession", gene)].to_list()
-        _, msa_global_reps = filter_msa(msa_index, msa_matrix, global_rep_ids)
-        global_reps_entropy = calculate_column_entropies(msa_global_reps)
+            if gene == "COI":
+                for codon_pos in range(3):
+                    gene_gainratio[f"{gene} {level} Pos {codon_pos + 1}"] = (
+                        gene_infogain[codon_pos::3] / gene_global_entropy[codon_pos::3]
+                    )
+                continue
 
-        gene_reps_entropy[gene] = global_reps_entropy
-        gene_info_gain[gene] = {}
-
-        for level in ["class", "order", "family", "genus"]:
-            group_reps_entropy = []
-            group_reps_weights = []
-            for group_name, group in gene_reps.groupby((f"worms_{level}", "")):
-                group_rep_ids = group[("accession", gene)].to_list()
-                _, msa_group_reps = filter_msa(msa_index, msa_matrix, group_rep_ids)
-                group_reps_entropy.append(
-                    calculate_column_entropies(msa_group_reps, min_nongap_elements=5)
-                )
-                group_reps_weights.append(len(group) / len(gene_reps))
-
-            group_reps_entropy = np.vstack(group_reps_entropy)
-            group_reps_entropy = np.ma.MaskedArray(
-                group_reps_entropy, mask=np.isnan(group_reps_entropy)
-            )
-
-            avg_reps_entropy = np.ma.average(group_reps_entropy, axis=0, weights=group_reps_weights)
-
-            # only calculate info gain for columns that werw globally informative
-            high_global_reps_entropy = global_reps_entropy.copy()
-            high_global_reps_entropy[global_reps_entropy < 0.5] = np.nan
-
-            reps_info_gain = np.clip(
-                high_global_reps_entropy - np.array(avg_reps_entropy),
-                a_min=0.0,
-                a_max=high_global_reps_entropy,
-            )
-
-            reps_info_gain = reps_info_gain / high_global_reps_entropy
-
-            gene_info_gain[gene][level] = reps_info_gain
-
-    for codon_pos in range(3):
-        gene_info_gain[f"COI Pos {codon_pos + 1}"] = {
-            level: level_val[codon_pos::3] for level, level_val in gene_info_gain["COI"].items()
-        }
+            gene_gainratio[f"{gene} {level}"] = gene_infogain / gene_global_entropy
 
     plot_entropy_boxplots(
-        {
-            f"{gene} {level}": level_val
-            for gene, gene_val in gene_info_gain.items()
-            for level, level_val in gene_val.items()
-            if gene != "COI"
-        },
+        gene_gainratio,
         outfile="level_boxplot.png",
     )
+
+    breakpoint()
+
+    #     # Calculate column entropies for gene representatives
+
+    #     gene_reps = pivot_df[pivot_df[("is_rep", gene)]]
+
+    #     global_rep_ids = gene_reps[("accession", gene)].to_list()
+    #     _, msa_global_reps = filter_msa(msa_index, msa_matrix, global_rep_ids)
+    #     global_reps_entropy = calculate_column_entropies(msa_global_reps)
+
+    #     gene_reps_entropy[gene] = global_reps_entropy
+    #     gene_info_gain[gene] = {}
+
+    #     for level in ["class", "order", "family", "genus"]:
+    #         group_reps_entropy = []
+    #         group_reps_weights = []
+    #         for group_name, group in gene_reps.groupby((f"worms_{level}", "")):
+    #             group_rep_ids = group[("accession", gene)].to_list()
+    #             _, msa_group_reps = filter_msa(msa_index, msa_matrix, group_rep_ids)
+    #             group_reps_entropy.append(
+    #                 calculate_column_entropies(msa_group_reps, min_nongap_elements=5)
+    #             )
+    #             group_reps_weights.append(len(group) / len(gene_reps))
+
+    #         group_reps_entropy = np.vstack(group_reps_entropy)
+    #         group_reps_entropy = np.ma.MaskedArray(
+    #             group_reps_entropy, mask=np.isnan(group_reps_entropy)
+    #         )
+
+    #         avg_reps_entropy = np.ma.average(group_reps_entropy, axis=0, weights=group_reps_weights)
+
+    #         # only calculate info gain for columns that werw globally informative
+    #         high_global_reps_entropy = global_reps_entropy.copy()
+    #         high_global_reps_entropy[global_reps_entropy < 0.5] = np.nan
+
+    #         reps_info_gain = np.clip(
+    #             high_global_reps_entropy - np.array(avg_reps_entropy),
+    #             a_min=0.0,
+    #             a_max=high_global_reps_entropy,
+    #         )
+
+    #         reps_info_gain = reps_info_gain / high_global_reps_entropy
+
+    #         gene_info_gain[gene][level] = reps_info_gain
+
+    # for codon_pos in range(3):
+    #     gene_info_gain[f"COI Pos {codon_pos + 1}"] = {
+    #         level: level_val[codon_pos::3] for level, level_val in gene_info_gain["COI"].items()
+    #     }
+
+    # plot_entropy_boxplots(
+    #     {
+    #         f"{gene} {level}": level_val
+    #         for gene, gene_val in gene_info_gain.items()
+    #         for level, level_val in gene_val.items()
+    #         if gene != "COI"
+    #     },
+    #     outfile="level_boxplot.png",
+    # )
 
     breakpoint()
 
