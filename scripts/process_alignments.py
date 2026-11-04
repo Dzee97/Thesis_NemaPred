@@ -582,7 +582,7 @@ def main() -> None:
 
     pivot_df = pivot_df[pivot_df["cluster_rep"]]
     msa_joined_matrix = msa_joined_matrix[pivot_df.index.to_numpy()]
-    pivot_df = pivot_df.reset_index()
+    pivot_df = pivot_df.reset_index(drop=True)
 
     tax_levels = ["class", "order", "family", "genus"]
     level_up_map = {
@@ -646,17 +646,13 @@ def main() -> None:
         for level in tax_levels
     }
 
-    for group_name, group_rows in pivot_df.groupby("worms_order", sort=False):
+    for group_name, group_rows in pivot_df.groupby("worms_family", sort=False):
         group_idx = group_rows.index.to_numpy()
         group_msa = msa_joined_matrix[group_idx]
 
         nondegen_mask = np.isin(group_msa, [ord(c) for c in ["A", "C", "G", "T"]])
-        overlap_gainratio = np.zeros((len(group_rows), len(group_rows)))
-        for level in tax_levels:
-            level_msa_gainratio = nondegen_mask * np.nan_to_num(level_gainratio[level])
-            level_overlap_gainratio = nondegen_mask @ level_msa_gainratio.T
-
-            overlap_gainratio += level_overlap_gainratio
+        msa_genus_gainratio = nondegen_mask * np.nan_to_num(level_gainratio["genus"])
+        overlap_gainratio = nondegen_mask @ msa_genus_gainratio.T
 
         pivot_df.loc[group_idx, "order_overlap_gainratio"] = np.mean(overlap_gainratio, axis=0)
 
@@ -673,9 +669,9 @@ def main() -> None:
         rep_idx = rep_rows.index.to_numpy()
         pivot_df.loc[rep_idx, "genus_rep"] = True
 
-    pivot_df = pivot_df[pivot_df.genus_rep & (pivot_df.order_overlap_gainratio >= 100)]
+    pivot_df = pivot_df[pivot_df.genus_rep & (pivot_df.order_overlap_gainratio >= 60)]
     msa_joined_matrix = msa_joined_matrix[pivot_df.index.to_numpy()]
-    pivot_df = pivot_df.reset_index()
+    pivot_df = pivot_df.reset_index(drop=True)
 
     pivot_df.to_csv(cfg.output_metadata)
 
