@@ -22,7 +22,8 @@ class Config:
     input_coi_ref_and_otu_prot_fasta: Path
     input_coi_ref_trimmed_fasta: Path
     input_coi_otu_trimmed_fasta: Path
-    output_parquet: Path
+    output_fasta: Path
+    output_metadata: Path
 
 
 def create_minimal_msa(
@@ -86,9 +87,7 @@ def _init_worker(df: pd.DataFrame, msa_matrix: np.ndarray, params: dict) -> None
     _WORKER_PARAMS = params
 
 
-def _process_column(
-    col_idx: int,
-) -> tuple[int, float | None, dict[str, float] | None]:
+def _process_column(col_idx: int) -> tuple[int, dict[str, float] | None]:
     """Processes a single MSA column inside a worker process."""
     df = cast(pd.DataFrame, _WORKER_DF)
     msa_matrix = cast(np.ndarray, _WORKER_MSA)
@@ -124,15 +123,15 @@ def _process_column(
         rep_mask[rep_all_idx] = True
 
     if np.sum(rep_mask) < min_observations:
-        return col_idx, None, None
+        return col_idx, None
 
     df_rep = df[rep_mask]
     global_entropy = calculate_entropy(col_vals[rep_mask])
 
     if global_entropy < min_global_entropy:
-        return col_idx, None, None
+        return col_idx, None
 
-    col_infogain: dict[str, float] = {}
+    level_entropy = {"global": global_entropy}
 
     for i, level in enumerate(tax_levels):
         group_entropies = []
@@ -167,11 +166,9 @@ def _process_column(
                 tax_step += 1
                 j = i - tax_step
 
-        level_entropy = np.average(group_entropies, weights=group_weights)
+        level_entropy[level] = float(np.average(group_entropies, weights=group_weights))
 
-        col_infogain[level] = float(np.clip(global_entropy - level_entropy, a_min=0.0, a_max=None))
-
-    return col_idx, global_entropy, col_infogain
+    return col_idx, level_entropy
 
 
 def calculate_species_balanced_column_entropies(
@@ -182,12 +179,10 @@ def calculate_species_balanced_column_entropies(
     min_global_entropy=0.25,
     min_split_size=3,
     num_processes=None,
-):
+) -> dict[str, np.ndarray]:
     msa_length = msa_matrix.shape[1]
 
-    col_global_entropy = np.full(msa_length, np.nan)
-    col_infogain = {l: np.full(msa_length, np.nan) for l in tax_levels}
-    col_gainratio = {l: np.full(msa_length, np.nan) for l in tax_levels}
+    col_level_entropy = {l: np.full(msa_length, np.nan) for l in ["global"] + tax_levels}
 
     params = {
         "min_observations": min_observations,
@@ -207,15 +202,13 @@ def calculate_species_balanced_column_entropies(
             desc="Calculating column entropies",
         )
 
-        for col_idx, global_entropy, infogain in results:
-            if global_entropy is None:
+        for col_idx, level_entropy in results:
+            if level_entropy is None:
                 continue
-            col_global_entropy[col_idx] = global_entropy
-            for level in tax_levels:
-                col_infogain[level][col_idx] = infogain[level]  # type: ignore
-                col_gainratio[level][col_idx] = infogain[level] / global_entropy  # type: ignore
+            for level in level_entropy:
+                col_level_entropy[level][col_idx] = level_entropy[level]
 
-    return col_global_entropy, col_infogain, col_gainratio
+    return col_level_entropy
 
 
 def plot_entropies(ref_entropies, ref_coverage, outfile, otu_entropies=None, otu_coverage=None):
@@ -489,9 +482,23 @@ def main() -> None:
     # Combine same voucher rows
 
     df_copy = df.reset_index()
-    df_copy.loc[df_copy.voucher.isna(), "voucher"] = (
-        "NA_" + df_copy.loc[df_copy.voucher.isna(), "accession"]
+
+    df_copy["voucher"] = df_copy.voucher.fillna("")
+
+    voucher_trans = str.maketrans({" ": "", "-": "", "_": ""})
+    df_copy["voucher_cleaned"] = df_copy.apply(
+        lambda row: (
+            row.voucher.lower()
+            .translate(voucher_trans)
+            .removesuffix("18s")
+            .removesuffix(row.worms_name.lower().translate(voucher_trans))
+        ),
+        axis=1,
     )
+
+    no_voucher = df_copy.voucher_cleaned == ""
+    df_copy.loc[no_voucher, "voucher_cleaned"] = "NA_" + df_copy.loc[no_voucher, "accession"]
+
     pivot_df = df_copy.pivot_table(
         index=[
             "trait_genus",
@@ -501,13 +508,26 @@ def main() -> None:
             "worms_genus",
             "worms_name",
             "worms_rank",
-            "ncbi_species",
-            "voucher",
+            "voucher_cleaned",
         ],
         columns="query_gene",
         values=["accession", "length"],
         aggfunc="first",
     ).reset_index()
+
+    pivot_df["joined_name"] = (
+        pivot_df.worms_name
+        + " "
+        + pivot_df.voucher_cleaned
+        + " "
+        + pivot_df.accession["18S"].astype(str)
+        + " "
+        + pivot_df.accession["28S"].astype(str)
+        + " "
+        + pivot_df.accession["COI"].astype(str)
+    )
+
+    pivot_df["joined_length"] = pivot_df.length.fillna(0).sum(axis=1)  # type: ignore
 
     # has_gene: pd.DataFrame = ~pivot_df.accession.isna()  # type: ignore
     # has_gene.columns = pd.MultiIndex.from_product([["has_gene"], has_gene.columns])
@@ -523,6 +543,10 @@ def main() -> None:
     start_col_28s, end_col_28s = msa_18s_length, msa_18s_length + msa_28s_length
     start_col_coi, end_col_coi = msa_18s_length + msa_28s_length, msa_joined_length
 
+    print(f"18S: {start_col_18s + 1}-{end_col_18s}")
+    print(f"28S: {start_col_28s + 1}-{end_col_28s}")
+    print(f"COI: {start_col_coi + 1}-{end_col_coi}")
+
     for gene, start_col, end_col, msa_index, msa_matrix in (
         ("18S", start_col_18s, end_col_18s, msa_18s_index, msa_18s_matrix),
         ("28S", start_col_28s, end_col_28s, msa_28s_index, msa_28s_matrix),
@@ -535,13 +559,42 @@ def main() -> None:
         _, insert_matrix = filter_msa(msa_index, msa_matrix, insert_ids)
         msa_joined_matrix[insert_idx, start_col:end_col] = insert_matrix
 
-    tax_levels = ["class", "order", "family", "genus"]
+    for species_name, species_rows in pivot_df.groupby("worms_name"):
+        species_rows = species_rows.sort_values("joined_length", ascending=False)
 
-    col_global_entropy, col_infogain, col_gainratio = calculate_species_balanced_column_entropies(
+        species_idx = species_rows.index.to_numpy()
+        species_msa_matrix = msa_joined_matrix[species_idx]
+
+        nondegen_mask = np.isin(species_msa_matrix, [ord(c) for c in ["A", "C", "G", "T"]])
+        mismatches = species_msa_matrix[:, None, :] != species_msa_matrix[None, :, :]
+        shared_nondegen = nondegen_mask[:, None, :] & nondegen_mask[None, :, :]
+        actual_mismatches = np.sum(mismatches & shared_nondegen, axis=2)
+        comparable_sites = np.sum(shared_nondegen, axis=2)
+
+        p_dist_matrix = actual_mismatches / comparable_sites
+
+        low_distance = np.zeros(len(species_rows), dtype=bool)
+        for i in range(len(species_rows)):
+            low_distance_idx = np.flatnonzero(p_dist_matrix[i, i + 1 :] < 0.01) + i + 1
+            low_distance[low_distance_idx] = True
+
+        pivot_df.loc[species_idx, "cluster_rep"] = ~low_distance
+
+    pivot_df = pivot_df[pivot_df["cluster_rep"]]
+    msa_joined_matrix = msa_joined_matrix[pivot_df.index.to_numpy()]
+    pivot_df = pivot_df.reset_index()
+
+    tax_levels = ["class", "order", "family", "genus"]
+    level_up_map = {
+        level: level_up for level, level_up in zip(tax_levels, ["global"] + tax_levels[:-1])
+    }
+
+    level_entropy = calculate_species_balanced_column_entropies(
         pivot_df, msa_joined_matrix, tax_levels
     )
 
-    gene_gainratio = {}
+    gene_global_gainratio = {}
+    gene_level_gainratio = {}
     for gene, start_col, end_col, offset, step in (
         ("18S", start_col_18s, end_col_18s, 0, 1),
         ("28S", start_col_28s, end_col_28s, 0, 1),
@@ -549,48 +602,91 @@ def main() -> None:
         ("COI 2nd", start_col_coi, end_col_coi, 1, 3),
         ("COI 3rd", start_col_coi, end_col_coi, 2, 3),
     ):
-        gene_gainratio[gene] = {
-            level: gainratio[start_col:end_col][offset::step]
-            for level, gainratio in col_gainratio.items()
+        gene_global_gainratio[gene] = {
+            level: np.clip(
+                level_entropy["global"][start_col:end_col][offset::step]
+                - level_entropy[level][start_col:end_col][offset::step],
+                a_min=0.0,
+                a_max=None,
+            )
+            / level_entropy["global"][start_col:end_col][offset::step]
+            for level in tax_levels
+        }
+
+        gene_level_gainratio[gene] = {
+            level: np.clip(
+                level_entropy[level_up_map[level]][start_col:end_col][offset::step]
+                - level_entropy[level][start_col:end_col][offset::step],
+                a_min=0.0,
+                a_max=None,
+            )
+            / level_entropy[level_up_map[level]][start_col:end_col][offset::step]
+            for level in tax_levels
         }
 
     plot_entropy_boxplots(
-        gene_gainratio,
+        gene_global_gainratio,
         ["coral", "skyblue", "lightgreen", "lightgreen", "lightgreen"],
-        outfile="level_boxplot.png",
+        outfile="gainratio_global_boxplot.png",
     )
 
-    plot_entropy_correlations(col_gainratio, outfile="level_correlations.png")
+    plot_entropy_boxplots(
+        gene_level_gainratio,
+        ["coral", "skyblue", "lightgreen", "lightgreen", "lightgreen"],
+        outfile="gainratio_level_boxplot.png",
+    )
 
-    for level in tax_levels:
-        pivot_df[f"mean_{level}_gainratio"] = np.nan
+    level_gainratio = {
+        level: np.clip(
+            level_entropy[level_up_map[level]] - level_entropy[level],
+            a_min=0.0,
+            a_max=None,
+        )
+        / level_entropy[level_up_map[level]]
+        for level in tax_levels
+    }
 
-        for group_name, group in pivot_df.groupby(f"worms_{level}", sort=False):
-            print(f"Level: {level}, Group: {group_name}")
+    for group_name, group_rows in pivot_df.groupby("worms_order", sort=False):
+        group_idx = group_rows.index.to_numpy()
+        group_msa = msa_joined_matrix[group_idx]
 
-            group_idx = group.index.to_numpy()
-            group_msa = msa_joined_matrix[group_idx]
+        nondegen_mask = np.isin(group_msa, [ord(c) for c in ["A", "C", "G", "T"]])
+        overlap_gainratio = np.zeros((len(group_rows), len(group_rows)))
+        for level in tax_levels:
+            level_msa_gainratio = nondegen_mask * np.nan_to_num(level_gainratio[level])
+            level_overlap_gainratio = nondegen_mask @ level_msa_gainratio.T
 
-            nondegen_mask = np.isin(group_msa, [ord(c) for c in ["A", "C", "G", "T"]])
-            group_msa_gainratio = nondegen_mask * np.nan_to_num(col_gainratio[level])
+            overlap_gainratio += level_overlap_gainratio
 
-            group_overlap_gainratio = nondegen_mask @ group_msa_gainratio.T
-            np.fill_diagonal(group_overlap_gainratio, np.nan)
+        pivot_df.loc[group_idx, "order_overlap_gainratio"] = np.mean(overlap_gainratio, axis=0)
 
-            mean_overlap_gainratio = np.nanmean(group_overlap_gainratio, axis=0)
-            pivot_df.loc[group_idx, f"mean_{level}_gainratio"] = mean_overlap_gainratio
+    pivot_df["genus_rep"] = False
+    for (group_rank, group_name), group_rows in pivot_df.groupby(
+        ["worms_rank", "worms_name"], sort=False
+    ):
+        high_mask = (
+            group_rows.order_overlap_gainratio >= 0.8 * group_rows.order_overlap_gainratio.max()
+        )
+        rep_rows = group_rows[high_mask].sort_values("order_overlap_gainratio", ascending=False)
+        rep_rows = rep_rows.head(1) if group_rank == "Species" else rep_rows.head(5)
 
-    pivot_df["high_gainratio"] = False
-    level_cols = [f"mean_{level}_gainratio" for level in tax_levels]
-    for group_name, group in pivot_df.groupby("worms_genus", sort=False):
-        group_idx = group.index.to_numpy()
-        max_gainratio = group[level_cols].max(axis=0)
-        std_gainratio = group[level_cols].std(axis=0)
-        high_gainratio = (group[level_cols] > (max_gainratio - 0.5 * std_gainratio)).any(axis=1)
+        rep_idx = rep_rows.index.to_numpy()
+        pivot_df.loc[rep_idx, "genus_rep"] = True
 
-        pivot_df.loc[group_idx, "high_gainratio"] = high_gainratio.to_numpy()
+    pivot_df = pivot_df[pivot_df.genus_rep & (pivot_df.order_overlap_gainratio >= 100)]
+    msa_joined_matrix = msa_joined_matrix[pivot_df.index.to_numpy()]
+    pivot_df = pivot_df.reset_index()
 
-    breakpoint()
+    pivot_df.to_csv(cfg.output_metadata)
+
+    seq_records = [skbio.DNA(row) for row in msa_joined_matrix]
+
+    newick_compat = str.maketrans({" ": "_", "(": "", ")": "", ":": ""})
+    with open(cfg.output_fasta, "w") as f:
+        f.writelines(
+            f">{name.translate(newick_compat)}\n{seq}\n"
+            for name, seq in zip(pivot_df.joined_name, seq_records)
+        )
 
 
 if __name__ == "__main__":

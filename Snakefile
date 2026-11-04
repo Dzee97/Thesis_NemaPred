@@ -183,7 +183,8 @@ rule process_alignments:
         input_coi_ref_trimmed_fasta = PROCESSED_DATA_DIR / "NCBI_COI_trimmed.fasta",
         input_coi_otu_trimmed_fasta = PROCESSED_DATA_DIR / "OTUs_COI_trimmed.fasta"
     output:
-        output_parquet = PROCESSED_DATA_DIR / "Sequuence_store_aligned.parquet"
+        output_fasta = PROCESSED_DATA_DIR / "Filtered_alignment.fasta",
+        output_metadata = PROCESSED_DATA_DIR / "Filtered_metadata.csv"
     script:
         "scripts/process_alignments.py"
 
