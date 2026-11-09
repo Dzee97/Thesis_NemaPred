@@ -186,7 +186,7 @@ rule process_alignments:
         output_fasta = PROCESSED_DATA_DIR / "Filtered_alignment.fasta",
         output_metadata = PROCESSED_DATA_DIR / "Filtered_metadata.csv"
     script:
-        "scripts/process_alignments.py"
+        "scripts/process_alignments2.py"
 
 # OLD METHOD
 
