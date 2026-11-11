@@ -26,6 +26,54 @@ class Config:
     output_metadata: Path
 
 
+def plot_infogain(infogain: np.ndarray, outfile: str):
+    x = np.arange(len(infogain))
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.scatter(x, infogain, alpha=0.8, s=6.0)
+
+    ax.set_title("Column Infogain (Alignment Order)")
+    ax.set_xlabel("Alignment Columns")
+    ax.set_ylabel("Infogain (bits)")
+
+    fig.tight_layout()
+    fig.savefig(outfile)
+    plt.close(fig)
+
+
+def plot_infogain_boxplots(infogain: np.ndarray, gene_start_idx: np.ndarray, outfile: str):
+    infogain_18s, infogain_28s, infogain_coi = np.split(infogain, gene_start_idx, axis=1)
+    infogain_coi1, infogain_coi2, infogain_coi3 = (
+        infogain_coi[:, 0::3],
+        infogain_coi[:, 1::3],
+        infogain_coi[:, 2::3],
+    )
+
+    data = [infogain_18s, infogain_28s, infogain_coi1, infogain_coi2, infogain_coi3]
+    data = [array[~np.isnan(array)].flatten() for array in data]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bplot = ax.boxplot(
+        data,
+        tick_labels=["18S", "28S", "COI 1st", "COI 2nd", "COI 3rd"],
+        patch_artist=True,  # Enables filling boxes with color
+        boxprops={"alpha": 0.7},
+        medianprops={"color": "black", "linewidth": 1},
+        flierprops={"marker": "o", "alpha": 0.3, "markersize": 4},  # Outliers
+    )
+
+    for patch, color in zip(
+        bplot["boxes"], ["coral", "skyblue", "lightgreen", "lightgreen", "lightgreen"]
+    ):
+        patch.set_facecolor(color)
+
+    ax.grid(True, linestyle="--", alpha=0.5)
+
+    fig.tight_layout()
+    fig.savefig(outfile)
+    plt.close(fig)
+
+
 def create_minimal_msa(
     seq_dict: dict[str, skbio.RNA | skbio.Protein],
     nuc_seqs: None | dict[str, skbio.DNA] = None,
@@ -91,7 +139,7 @@ def join_msas(
     msa_28s_index: dict[str, int],
     msa_coi: np.ndarray,
     msa_coi_index: dict[str, int],
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     msa_18s_length, msa_28s_length, msa_coi_length = (
         msa_18s.shape[1],
         msa_28s.shape[1],
@@ -116,7 +164,7 @@ def join_msas(
         _, insert_matrix = filter_msa(msa_index, msa_matrix, insert_ids)
         msa_joined[insert_idx, start_col:end_col] = insert_matrix
 
-    return msa_joined
+    return msa_joined, np.array([start_col_28s, start_col_coi])
 
 
 def load_seq_dict(
@@ -126,15 +174,6 @@ def load_seq_dict(
         seq.metadata["id"]: seq
         for seq in skbio.read(fasta_path, format="fasta", constructor=constructor)
     }
-
-
-def calculate_smoothed_entropy(elements: np.ndarray, num_categories: int, alpha=0.5) -> float:
-    denominator = len(elements) + (alpha * num_categories)
-    _, counts = np.unique(elements, return_counts=True)
-    full_counts = np.zeros(num_categories, dtype=int)
-    full_counts[: len(counts)] = counts
-    probs = (full_counts + alpha) / denominator
-    return float(entropy(probs, base=2))
 
 
 def main() -> None:
@@ -203,13 +242,9 @@ def main() -> None:
             "worms_order",
             "worms_family",
             "worms_genus",
-            "worms_name",
-            "worms_rank",
-            "trait_genus",
             "total_length",
-            "voucher_norm",
         ],
-        ascending=[True, True, True, True, True, True, True, False, True],
+        ascending=[True, True, True, True, False],
     ).reset_index(drop=True)
 
     pivot_df["name"] = pivot_df.apply(
@@ -220,7 +255,7 @@ def main() -> None:
     )
 
     # Construct joined msa
-    msa_joined = join_msas(
+    msa_joined, gene_start_idx = join_msas(
         pivot_df.accession,  # type: ignore
         msa_18s,
         msa_18s_index,
@@ -230,92 +265,110 @@ def main() -> None:
         msa_coi_index,
     )
 
-    nondegen_mask = np.isin(msa_joined, [ord(c) for c in ["A", "C", "G", "T"]])
+    # Set non-degenerate characters and gaps to 0
+    bases = ("A", "C", "G", "T")
+    nondegen_mask = np.isin(msa_joined, [ord(b) for b in bases])
+    msa_joined[~nondegen_mask] = 0
 
-    worms_family = pivot_df.worms_order.to_numpy()
+    # Find genus boundry indices
     worms_genus = pivot_df.worms_genus.to_numpy()
-    worms_name = pivot_df.worms_name.to_numpy()
-    worms_rank = pivot_df.worms_rank.to_numpy()
-    total_length = pivot_df.total_length.to_numpy()
+    worms_genus_start_idx = np.flatnonzero(worms_genus[:-1] != worms_genus[1:]) + 1
 
-    for family in np.unique(worms_family):
-        print(family)
-
-        family_idx = np.flatnonzero(worms_family == family)
-
-        family_worms_genus = worms_genus[family_idx]
-        family_worms_genus_unique = np.unique(family_worms_genus)
-        if len(family_worms_genus_unique) < 2:
-            continue
-
-        family_worms_name = worms_name[family_idx]
-        family_is_species = worms_rank[family_idx] == "Species"
-
-        family_col_weights = np.zeros(msa_joined.shape[1])
-        for col_idx in tqdm(range(msa_joined.shape[1])):
-            family_col_nondegen_idx = np.flatnonzero(nondegen_mask[family_idx, col_idx])
-            if len(family_col_nondegen_idx) < 10:
+    # Greedy prefer longest p-distance clustering (99%)
+    keep = np.ones(len(pivot_df), dtype=bool)
+    for msa_genus, keep_genus in zip(
+        np.split(msa_joined, worms_genus_start_idx, axis=0),
+        np.split(keep, worms_genus_start_idx, axis=0),
+    ):
+        for i in range(msa_genus.shape[0] - 1):
+            if not keep_genus[i]:
                 continue
 
-            family_col_worms_genus = family_worms_genus[family_col_nondegen_idx]
-            family_col_worms_genus_unique = np.unique(family_col_worms_genus)
-            if len(family_col_worms_genus_unique) < 2:
-                continue
+            shared_nondegen = (msa_genus[i] != 0) & (msa_genus[i + 1 :] != 0)
+            mismatches = (msa_genus[i] != msa_genus[i + 1 :]) & shared_nondegen
+            with np.errstate(invalid="ignore"):
+                p_dist = np.sum(mismatches, axis=1) / np.sum(shared_nondegen, axis=1)
 
-            family_col_vals = msa_joined[family_idx, col_idx][family_col_nondegen_idx]
-            family_col_worms_name = family_worms_name[family_col_nondegen_idx]
-            family_col_rep_mask = ~family_is_species[family_col_nondegen_idx]
+            keep_genus[i + 1 :] &= np.isnan(p_dist) | (p_dist > 0.01)
 
-            for species in np.unique(family_col_worms_name[~family_col_rep_mask]):
-                species_idx = np.flatnonzero(family_col_worms_name == species)
-                species_col_vals = family_col_vals[species_idx]
+    # Filter out redundant sequences
+    pivot_df = pivot_df[keep].reset_index(drop=True)
+    msa_joined = msa_joined[keep]
 
-                vals, counts = np.unique(species_col_vals, return_counts=True)
-                max_idx = np.argmax(counts)
-                max_val = vals[max_idx]
+    # Find order and genus boundry indices
+    worms_order = pivot_df.worms_order.to_numpy()
+    worms_genus = pivot_df.worms_genus.to_numpy()
 
-                rep_species_idx = np.argmax(species_col_vals == max_val)
-                family_col_rep_mask[species_idx[rep_species_idx]] = True
+    worms_genus_start_idx = np.flatnonzero(worms_genus[:-1] != worms_genus[1:]) + 1
 
-            family_col_rep_vals = family_col_vals[family_col_rep_mask]
-            family_col_entropy = calculate_smoothed_entropy(family_col_rep_vals, num_categories=4)
+    worms_genus_base_probs = np.full(
+        (worms_genus_start_idx.shape[0] + 1, len(bases), msa_joined.shape[1]), np.nan
+    )
+    worms_genus_base_entropy = np.full(
+        (worms_genus_start_idx.shape[0] + 1, msa_joined.shape[1]), np.nan
+    )
 
-            family_col_rep_genus = family_col_worms_genus[family_col_rep_mask]
-            family_col_infogain = family_col_entropy
-            for genus in family_col_worms_genus_unique:
-                genus_idx = np.flatnonzero(family_col_rep_genus == genus)
-                genus_col_rep_vals = family_col_rep_vals[genus_idx]
-                genus_col_entropy = calculate_smoothed_entropy(genus_col_rep_vals, num_categories=4)
+    alpha = 0.5
+    min_seqs = 3
 
-                family_col_infogain -= (
-                    len(genus_col_rep_vals) / len(family_col_rep_vals) * genus_col_entropy
-                )
+    for msa_genus, base_probs, base_entropy in tqdm(
+        zip(
+            np.split(msa_joined, worms_genus_start_idx, axis=0),
+            worms_genus_base_probs,
+            worms_genus_base_entropy,
+        )
+    ):
+        base_counts = np.vstack([np.sum(msa_genus == ord(b), axis=0) for b in bases]) + alpha
+        base_total = np.sum(base_counts, axis=0)
+        base_total_mask = base_total >= min_seqs + alpha * base_counts.shape[0]
 
-            family_col_intrinsic = calculate_smoothed_entropy(
-                family_col_rep_genus, num_categories=len(family_worms_genus_unique)
-            )
-            family_col_weights[col_idx] = np.clip(family_col_infogain, a_min=0.0, a_max=None) / (
-                family_col_intrinsic * family_col_entropy
-            )
+        base_probs[:, base_total_mask] = (
+            base_counts[:, base_total_mask] / base_total[base_total_mask]
+        )
 
-        family_msa = msa_joined[family_idx]
-        family_nondegen_mask = nondegen_mask[family_idx]
+        base_entropy[base_total_mask] = entropy(base_probs[:, base_total_mask], base=2, axis=0)
 
-        family_mismatches = family_msa[:, None, :] != family_msa[None, :, :]
-        family_shared_nondegen = family_nondegen_mask[:, None, :] & family_nondegen_mask[None, :, :]
-        family_nondegen_mismatches = family_mismatches & family_shared_nondegen
+    worms_genus_order = worms_order[np.concat(([0], worms_genus_start_idx))]
+    worms_genus_order_start_idx = (
+        np.flatnonzero(worms_genus_order[:-1] != worms_genus_order[1:]) + 1
+    )
 
-        family_weighted_p_dist = np.sum(
-            family_nondegen_mismatches * family_col_weights, axis=2
-        ) / np.sum(family_shared_nondegen * family_col_weights, axis=2)
-        np.fill_diagonal(family_weighted_p_dist, np.nan)
+    worms_order_base_entropy = np.full(
+        (worms_genus_order_start_idx.shape[0] + 1, msa_joined.shape[1]), np.nan
+    )
+    worms_order_infogain = np.full(
+        (worms_genus_order_start_idx.shape[0] + 1, msa_joined.shape[1]), np.nan
+    )
 
-        for genus in family_worms_genus_unique:
-            genus_idx = np.flatnonzero(family_worms_genus == genus)
-            genus_weighted_p_dist = family_weighted_p_dist[np.ix_(genus_idx, genus_idx)]
-            low_dist = genus_weighted_p_dist < 0.05
-            low_dist[np.tril_indices_from(low_dist)] = False
-            breakpoint()
+    min_genera = 3
+
+    for base_probs, base_entropy, order_base_entropy, order_infogain in tqdm(
+        zip(
+            np.split(worms_genus_base_probs, worms_genus_order_start_idx, axis=0),
+            np.split(worms_genus_base_entropy, worms_genus_order_start_idx, axis=0),
+            worms_order_base_entropy,
+            worms_order_infogain,
+        )
+    ):
+        num_genera = np.sum(~np.isnan(base_entropy), axis=0)
+        num_genera_mask = num_genera >= min_genera
+
+        order_base_probs = np.nanmean(base_probs[:, :, num_genera_mask], axis=0)
+        order_base_entropy[num_genera_mask] = entropy(order_base_probs, base=2, axis=0)  # type: ignore
+
+        order_infogain[num_genera_mask] = np.clip(
+            order_base_entropy[num_genera_mask]
+            - np.nanmean(base_entropy[:, num_genera_mask], axis=0),
+            a_min=0.0,
+            a_max=2.0,
+        )
+
+        plot_infogain(order_infogain, "order_infogain.png")
+
+    plot_infogain_boxplots(worms_order_infogain, gene_start_idx, "order_infogain_boxplot.png")
+    plot_infogain_boxplots(worms_order_base_entropy, gene_start_idx, "order_entropy_boxplot.png")
+
+    breakpoint()
 
 
 if __name__ == "__main__":
