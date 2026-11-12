@@ -41,6 +41,27 @@ def plot_infogain(infogain: np.ndarray, outfile: str):
     plt.close(fig)
 
 
+def plot_infogain_std(
+    infogain: np.ndarray, gene_start_idx: np.ndarray, std: np.ndarray, outfile: str
+):
+    x = infogain.flatten()
+    y = std.flatten()
+
+    mask = x > y
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.scatter(x[mask], y[mask], alpha=0.3, s=6.0)
+    ax.scatter(x[~mask], y[~mask], alpha=0.3, s=6.0)
+
+    ax.set_title("Column Infogain VS Genus Entropy Standard Deviation")
+    ax.set_xlabel("Infogain (bits)")
+    ax.set_ylabel("Genus Entropy Std")
+
+    fig.tight_layout()
+    fig.savefig(outfile)
+    plt.close(fig)
+
+
 def plot_infogain_boxplots(infogain: np.ndarray, gene_start_idx: np.ndarray, outfile: str):
     infogain_18s, infogain_28s, infogain_coi = np.split(infogain, gene_start_idx, axis=1)
     infogain_coi1, infogain_coi2, infogain_coi3 = (
@@ -308,8 +329,8 @@ def main() -> None:
         (worms_genus_start_idx.shape[0] + 1, msa_joined.shape[1]), np.nan
     )
 
-    alpha = 0.5
-    min_seqs = 3
+    alpha = 0.1
+    min_seqs = 2
 
     for msa_genus, base_probs, base_entropy in tqdm(
         zip(
@@ -339,15 +360,19 @@ def main() -> None:
     worms_order_infogain = np.full(
         (worms_genus_order_start_idx.shape[0] + 1, msa_joined.shape[1]), np.nan
     )
+    worms_order_genus_std = np.full(
+        (worms_genus_order_start_idx.shape[0] + 1, msa_joined.shape[1]), np.nan
+    )
 
     min_genera = 3
 
-    for base_probs, base_entropy, order_base_entropy, order_infogain in tqdm(
+    for base_probs, base_entropy, order_base_entropy, order_infogain, order_genus_std in tqdm(
         zip(
             np.split(worms_genus_base_probs, worms_genus_order_start_idx, axis=0),
             np.split(worms_genus_base_entropy, worms_genus_order_start_idx, axis=0),
             worms_order_base_entropy,
             worms_order_infogain,
+            worms_order_genus_std,
         )
     ):
         num_genera = np.sum(~np.isnan(base_entropy), axis=0)
@@ -363,10 +388,22 @@ def main() -> None:
             a_max=2.0,
         )
 
-        plot_infogain(order_infogain, "order_infogain.png")
+        order_genus_std[num_genera_mask] = np.nanstd(base_entropy[:, num_genera_mask], axis=0)
+
+        infogain_mask = order_infogain > order_genus_std
+        order_infogain[~infogain_mask] = np.nan
+
+        order_infogain[infogain_mask] /= order_base_entropy[infogain_mask]
 
     plot_infogain_boxplots(worms_order_infogain, gene_start_idx, "order_infogain_boxplot.png")
     plot_infogain_boxplots(worms_order_base_entropy, gene_start_idx, "order_entropy_boxplot.png")
+    # plot_infogain_std(
+    #    worms_order_infogain, gene_start_idx, worms_order_genus_std, "order_infogain_std_comp.png"
+    # )
+
+    infogain_18s, infogain_28s, infogain_coi = np.split(
+        worms_order_infogain, gene_start_idx, axis=1
+    )
 
     breakpoint()
 
