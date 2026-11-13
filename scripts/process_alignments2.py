@@ -1,15 +1,13 @@
-import multiprocessing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import skbio
 from common import parse_config
-from matplotlib.axes import Axes
-from scipy.stats import entropy
+from scipy.stats import entropy as calc_entropy
+from scipy.stats import zscore
 from tqdm import tqdm
 
 
@@ -41,9 +39,7 @@ def plot_infogain(infogain: np.ndarray, outfile: str):
     plt.close(fig)
 
 
-def plot_infogain_std(
-    infogain: np.ndarray, gene_start_idx: np.ndarray, std: np.ndarray, outfile: str
-):
+def plot_infogain_std(infogain: np.ndarray, std: np.ndarray, outfile: str):
     x = infogain.flatten()
     y = std.flatten()
 
@@ -63,6 +59,9 @@ def plot_infogain_std(
 
 
 def plot_infogain_boxplots(infogain: np.ndarray, gene_start_idx: np.ndarray, outfile: str):
+    if infogain.ndim == 1:
+        infogain = infogain[None,]
+
     infogain_18s, infogain_28s, infogain_coi = np.split(infogain, gene_start_idx, axis=1)
     infogain_coi1, infogain_coi2, infogain_coi3 = (
         infogain_coi[:, 0::3],
@@ -292,14 +291,14 @@ def main() -> None:
     msa_joined[~nondegen_mask] = 0
 
     # Find genus boundry indices
-    worms_genus = pivot_df.worms_genus.to_numpy()
-    worms_genus_start_idx = np.flatnonzero(worms_genus[:-1] != worms_genus[1:]) + 1
+    genus_col = pivot_df.worms_genus.to_numpy()
+    genus_start_idx = np.flatnonzero(genus_col[:-1] != genus_col[1:]) + 1
 
     # Greedy prefer longest p-distance clustering (99%)
     keep = np.ones(len(pivot_df), dtype=bool)
     for msa_genus, keep_genus in zip(
-        np.split(msa_joined, worms_genus_start_idx, axis=0),
-        np.split(keep, worms_genus_start_idx, axis=0),
+        np.split(msa_joined, genus_start_idx, axis=0),
+        np.split(keep, genus_start_idx, axis=0),
     ):
         for i in range(msa_genus.shape[0] - 1):
             if not keep_genus[i]:
@@ -316,94 +315,108 @@ def main() -> None:
     pivot_df = pivot_df[keep].reset_index(drop=True)
     msa_joined = msa_joined[keep]
 
-    # Find order and genus boundry indices
-    worms_order = pivot_df.worms_order.to_numpy()
-    worms_genus = pivot_df.worms_genus.to_numpy()
+    # Find genus boundry indices
+    genus_col = pivot_df.worms_genus.to_numpy()
+    genus_start_idx = np.flatnonzero(genus_col[:-1] != genus_col[1:]) + 1
 
-    worms_genus_start_idx = np.flatnonzero(worms_genus[:-1] != worms_genus[1:]) + 1
+    # Initialize arrays for genus nucleotide probabilities and entropies
+    genus_probs = np.full((genus_start_idx.shape[0] + 1, len(bases), msa_joined.shape[1]), np.nan)
+    genus_entropy = np.full((genus_start_idx.shape[0] + 1, msa_joined.shape[1]), np.nan)
 
-    worms_genus_base_probs = np.full(
-        (worms_genus_start_idx.shape[0] + 1, len(bases), msa_joined.shape[1]), np.nan
-    )
-    worms_genus_base_entropy = np.full(
-        (worms_genus_start_idx.shape[0] + 1, msa_joined.shape[1]), np.nan
-    )
+    # Pseudocount parameter for Laplace smoothing
+    alpha = 0.05
 
-    alpha = 0.1
-    min_seqs = 2
+    # Minimum number of sequences covering a column in a genus
+    min_seqs = 5
 
-    for msa_genus, base_probs, base_entropy in tqdm(
+    # Loop over genera, calculate their nucleotide probabilities and entropies
+    for msa_genus, probs, entropy in tqdm(
         zip(
-            np.split(msa_joined, worms_genus_start_idx, axis=0),
-            worms_genus_base_probs,
-            worms_genus_base_entropy,
+            np.split(msa_joined, genus_start_idx, axis=0),
+            genus_probs,
+            genus_entropy,
         )
     ):
         base_counts = np.vstack([np.sum(msa_genus == ord(b), axis=0) for b in bases]) + alpha
         base_total = np.sum(base_counts, axis=0)
-        base_total_mask = base_total >= min_seqs + alpha * base_counts.shape[0]
+        base_total_mask = base_total >= min_seqs + alpha * len(bases)
 
-        base_probs[:, base_total_mask] = (
-            base_counts[:, base_total_mask] / base_total[base_total_mask]
-        )
+        probs[:, base_total_mask] = base_counts[:, base_total_mask] / base_total[base_total_mask]
 
-        base_entropy[base_total_mask] = entropy(base_probs[:, base_total_mask], base=2, axis=0)
+        entropy[base_total_mask] = calc_entropy(probs[:, base_total_mask], base=2, axis=0)
 
-    worms_genus_order = worms_order[np.concat(([0], worms_genus_start_idx))]
-    worms_genus_order_start_idx = (
-        np.flatnonzero(worms_genus_order[:-1] != worms_genus_order[1:]) + 1
+    # Initialize arrays for global entropies, genus infogain and genus entropy standard deviation
+    global_entropy = np.full(msa_joined.shape[1], np.nan)
+    genus_infogain = np.full(msa_joined.shape[1], np.nan)
+    genus_entropy_std = np.full(msa_joined.shape[1], np.nan)
+
+    # Minimum number of genera covering a column for infogain calculation
+    min_genera = 5
+
+    # Calculate the global entropy, genus infogain and genus entropy standard deviation
+    num_genera = np.sum(~np.isnan(genus_entropy), axis=0)
+    num_genera_mask = num_genera >= min_genera
+
+    global_probs = np.nanmean(genus_probs[:, :, num_genera_mask], axis=0)
+    global_entropy[num_genera_mask] = calc_entropy(global_probs, base=2, axis=0)  # type: ignore
+
+    genus_infogain[num_genera_mask] = np.clip(
+        global_entropy[num_genera_mask] - np.nanmean(genus_entropy[:, num_genera_mask], axis=0),
+        a_min=0.0,
+        a_max=2.0,
     )
 
-    worms_order_base_entropy = np.full(
-        (worms_genus_order_start_idx.shape[0] + 1, msa_joined.shape[1]), np.nan
-    )
-    worms_order_infogain = np.full(
-        (worms_genus_order_start_idx.shape[0] + 1, msa_joined.shape[1]), np.nan
-    )
-    worms_order_genus_std = np.full(
-        (worms_genus_order_start_idx.shape[0] + 1, msa_joined.shape[1]), np.nan
-    )
+    genus_entropy_std[num_genera_mask] = np.nanstd(genus_entropy[:, num_genera_mask], axis=0)
 
-    min_genera = 3
+    # Plot class entropy grouped by gene
+    plot_infogain_boxplots(global_entropy, gene_start_idx, "global_entropy_boxplot.png")
 
-    for base_probs, base_entropy, order_base_entropy, order_infogain, order_genus_std in tqdm(
-        zip(
-            np.split(worms_genus_base_probs, worms_genus_order_start_idx, axis=0),
-            np.split(worms_genus_base_entropy, worms_genus_order_start_idx, axis=0),
-            worms_order_base_entropy,
-            worms_order_infogain,
-            worms_order_genus_std,
-        )
+    # Plot class to genus infogain against genus entropy standard deviation
+    plot_infogain_std(genus_infogain, genus_entropy_std, "genus_infogain_std_comp.png")
+
+    # Discard columns where the genus entropy standard deviation is higher than the infogain
+    infogain_mask = genus_infogain > genus_entropy_std
+    genus_infogain[~infogain_mask] = np.nan
+
+    # Plot the class to genus infogain
+    plot_infogain_boxplots(genus_infogain, gene_start_idx, "genus_infogain_boxplot.png")
+
+    # Calculate gain ratio by dividing infogain by class entropy
+    genus_gainratio = genus_infogain.copy()
+    genus_gainratio[infogain_mask] /= global_entropy[infogain_mask]
+
+    # Plot the class to genus gainratio
+    plot_infogain_boxplots(genus_gainratio, gene_start_idx, "genus_gainratio_boxplot.png")
+
+    family_col = pivot_df.worms_family.to_numpy()
+    family_start_idx = np.flatnonzero(family_col[:-1] != family_col[1:]) + 1
+
+    all_summed_gainratio = np.full(len(pivot_df), np.nan)
+    family_overlap_gainratio = np.full(len(pivot_df), np.nan)
+    for msa_family, overlap_gainratio, summed_gainratio in zip(
+        np.split(msa_joined, family_start_idx, axis=0),
+        np.split(family_overlap_gainratio, family_start_idx, axis=0),
+        np.split(all_summed_gainratio, family_start_idx, axis=0),
     ):
-        num_genera = np.sum(~np.isnan(base_entropy), axis=0)
-        num_genera_mask = num_genera >= min_genera
+        nondegen = msa_family != 0
+        msa_gainratio = nondegen * np.nan_to_num(genus_gainratio)
 
-        order_base_probs = np.nanmean(base_probs[:, :, num_genera_mask], axis=0)
-        order_base_entropy[num_genera_mask] = entropy(order_base_probs, base=2, axis=0)  # type: ignore
+        pairwise_overlap_gainratio = nondegen @ msa_gainratio.T
 
-        order_infogain[num_genera_mask] = np.clip(
-            order_base_entropy[num_genera_mask]
-            - np.nanmean(base_entropy[:, num_genera_mask], axis=0),
-            a_min=0.0,
-            a_max=2.0,
-        )
+        summed_gainratio[:] = np.diagonal(pairwise_overlap_gainratio)
+        overlap_gainratio[:] = np.mean(pairwise_overlap_gainratio, axis=0)
 
-        order_genus_std[num_genera_mask] = np.nanstd(base_entropy[:, num_genera_mask], axis=0)
+    pivot_df["summed_gainratio"] = all_summed_gainratio
+    pivot_df["family_overlap_gainratio"] = family_overlap_gainratio
 
-        infogain_mask = order_infogain > order_genus_std
-        order_infogain[~infogain_mask] = np.nan
-
-        order_infogain[infogain_mask] /= order_base_entropy[infogain_mask]
-
-    plot_infogain_boxplots(worms_order_infogain, gene_start_idx, "order_infogain_boxplot.png")
-    plot_infogain_boxplots(worms_order_base_entropy, gene_start_idx, "order_entropy_boxplot.png")
-    # plot_infogain_std(
-    #    worms_order_infogain, gene_start_idx, worms_order_genus_std, "order_infogain_std_comp.png"
-    # )
-
-    infogain_18s, infogain_28s, infogain_coi = np.split(
-        worms_order_infogain, gene_start_idx, axis=1
+    family_max = pivot_df.groupby("worms_genus").family_overlap_gainratio.transform("max")
+    genus_rep = (pivot_df.family_overlap_gainratio > 0.9 * family_max) & (
+        pivot_df.summed_gainratio > 100
     )
+
+    pivot_df = pivot_df[genus_rep]
+
+    pivot_df.to_csv(cfg.output_metadata)
 
     breakpoint()
 
