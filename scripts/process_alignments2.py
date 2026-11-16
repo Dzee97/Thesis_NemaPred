@@ -38,28 +38,31 @@ def plot_coverage(
 
     ref_nongap_mask = msa_joined != ord("-")
     ref_coverage = np.sum(ref_nongap_mask, axis=0) / ref_nongap_mask.shape[0]
+    ref_coverage[ref_coverage == 0.0] = np.nan
 
     x = np.arange(msa_joined.shape[1])
-    ax.scatter(x, ref_coverage, alpha=0.8, s=3.0, label="NCBI Refs")
+    ax.scatter(x, ref_coverage, alpha=0.8, s=2.0, label="NCBI Refs")
 
     otu_18s_nongap_mask = msa_18s_otu != ord("-")
     otu_18s_coverage = np.sum(otu_18s_nongap_mask, axis=0) / otu_18s_nongap_mask.shape[0]
+    otu_18s_coverage[otu_18s_coverage == 0.0] = np.nan
 
     x = np.arange(msa_18s_otu.shape[1])
-    ax.scatter(x, otu_18s_coverage, alpha=0.8, s=3.0, label="18S OTUs")
+    ax.scatter(x, otu_18s_coverage, alpha=0.8, s=2.0, label="18S OTUs")
 
     otu_coi_nongap_mask = msa_coi_otu != ord("-")
     otu_coi_coverage = np.sum(otu_coi_nongap_mask, axis=0) / otu_coi_nongap_mask.shape[0]
+    otu_coi_coverage[otu_coi_coverage == 0.0] = np.nan
 
     x = np.arange(gene_start_idx[1], gene_start_idx[1] + msa_coi_otu.shape[1])
-    ax.scatter(x, otu_coi_coverage, alpha=0.8, s=3.0, label="COI OTUs")
+    ax.scatter(x, otu_coi_coverage, alpha=0.8, s=2.0, label="COI OTUs")
 
     for boundry, label_left, label_right in zip(gene_start_idx, ("18S", "28S"), ("28S", "COI")):
         ax.axvline(boundry, c="black", linewidth=0.5)
         ax.text(
             boundry,
             0.99,
-            label_left,
+            label_right,
             color="black",
             ha="left",
             va="top",
@@ -70,7 +73,7 @@ def plot_coverage(
         ax.text(
             boundry,
             0.99,
-            label_right,
+            label_left,
             color="black",
             ha="right",
             va="top",
@@ -202,6 +205,24 @@ def filter_msa(
     return new_msa_index, new_msa
 
 
+def filter_otu_outliers(msa_index: dict[str, int], msa: np.ndarray, frame_margin=6) -> list[str]:
+    reverse_index = {idx: id for id, idx in msa_index.items()}
+
+    nongap_mask = msa != ord("-")
+    first_col = np.argmax(nongap_mask, axis=1)
+    median_first_col = np.median(first_col)
+
+    last_col = np.argmax(nongap_mask[:, ::-1], axis=1)
+    median_last_col = np.median(last_col)
+
+    valid_idx = np.flatnonzero(
+        (np.abs(first_col - median_first_col) <= frame_margin)
+        & (np.abs(last_col - median_last_col) <= frame_margin)
+    )
+
+    return [reverse_index[int(idx)] for idx in valid_idx]
+
+
 def join_msas(
     matched_accessions: pd.DataFrame,
     msa_18s: np.ndarray,
@@ -255,6 +276,11 @@ def main() -> None:
     # Load 18S alignment
     seqs_18s_ref = load_seq_dict(cfg.input_18s_ref_fasta, skbio.DNA)
     seqs_18s_otu = load_seq_dict(cfg.input_18s_otu_fasta, skbio.DNA)
+
+    msa_18s_otu_index, msa_18s_otu = create_minimal_msa(seqs_18s_otu)
+    valid_18s_otu_ids = filter_otu_outliers(msa_18s_otu_index, msa_18s_otu)
+
+    seqs_18s_otu = {id: seqs_18s_otu[id] for id in valid_18s_otu_ids}
     seqs_18s = seqs_18s_ref | seqs_18s_otu
 
     msa_18s_index, msa_18s = create_minimal_msa(seqs_18s)
@@ -266,11 +292,21 @@ def main() -> None:
     msa_28s_ref_index, msa_28s_ref = create_minimal_msa(seqs_28s_ref)
 
     # Load COI alignment
-    prot_seqs_coi = load_seq_dict(cfg.input_coi_ref_and_otu_prot_fasta, skbio.Protein)
-
     nuc_seqs_coi_ref = load_seq_dict(cfg.input_coi_ref_trimmed_fasta, skbio.DNA)
     nuc_seqs_coi_otu = load_seq_dict(cfg.input_coi_otu_trimmed_fasta, skbio.DNA)
+
+    prot_seqs_coi = load_seq_dict(cfg.input_coi_ref_and_otu_prot_fasta, skbio.Protein)
+    prot_seqs_coi_ref = {id: prot_seqs_coi[id] for id in nuc_seqs_coi_ref}
+    prot_seqs_coi_otu = {id: prot_seqs_coi[id] for id in nuc_seqs_coi_otu}
+
+    msa_coi_otu_index, msa_coi_otu = create_minimal_msa(prot_seqs_coi_otu, nuc_seqs_coi_otu)
+    valid_coi_otu_ids = filter_otu_outliers(msa_coi_otu_index, msa_coi_otu)
+
+    nuc_seqs_coi_otu = {id: nuc_seqs_coi_otu[id] for id in valid_coi_otu_ids}
+    prot_seqs_coi_otu = {id: prot_seqs_coi_otu[id] for id in valid_coi_otu_ids}
+
     nuc_seqs_coi = nuc_seqs_coi_ref | nuc_seqs_coi_otu
+    prot_seqs_coi = prot_seqs_coi_ref | prot_seqs_coi_otu
 
     msa_coi_index, msa_coi = create_minimal_msa(prot_seqs_coi, nuc_seqs=nuc_seqs_coi)
     msa_coi_ref_index, msa_coi_ref = filter_msa(
