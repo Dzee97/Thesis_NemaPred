@@ -182,9 +182,14 @@ rule process_alignments:
         input_coi_ref_and_otu_prot_fasta = PROCESSED_DATA_DIR / "NCBI_COI_with_OTUs_prot_aligned.fasta",
         input_coi_ref_trimmed_fasta = PROCESSED_DATA_DIR / "NCBI_COI_trimmed.fasta",
         input_coi_otu_trimmed_fasta = PROCESSED_DATA_DIR / "OTUs_COI_trimmed.fasta"
+    params:
+        overlap_gainratio_frac = 0.8,
+        min_summed_gainratio = 100,
+        partition_model = "GTR+G"
     output:
         output_fasta = PROCESSED_DATA_DIR / "Filtered_alignment.fasta",
-        output_metadata = PROCESSED_DATA_DIR / "Filtered_metadata.csv"
+        output_metadata = PROCESSED_DATA_DIR / "Filtered_metadata.csv",
+        output_partition = PROCESSED_DATA_DIR / "Filtered_alignment.partition"
     script:
         "scripts/process_alignments2.py"
 

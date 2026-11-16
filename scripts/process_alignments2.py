@@ -7,7 +7,6 @@ import pandas as pd
 import skbio
 from common import parse_config
 from scipy.stats import entropy as calc_entropy
-from scipy.stats import zscore
 from tqdm import tqdm
 
 
@@ -20,20 +19,72 @@ class Config:
     input_coi_ref_and_otu_prot_fasta: Path
     input_coi_ref_trimmed_fasta: Path
     input_coi_otu_trimmed_fasta: Path
+    overlap_gainratio_frac: float
+    min_summed_gainratio: float
+    partition_model: str
     output_fasta: Path
     output_metadata: Path
+    output_partition: Path
 
 
-def plot_infogain(infogain: np.ndarray, outfile: str):
-    x = np.arange(len(infogain))
+def plot_coverage(
+    msa_joined: np.ndarray,
+    gene_start_idx: np.ndarray,
+    msa_18s_otu: np.ndarray,
+    msa_coi_otu: np.ndarray,
+    outfile: str,
+):
+    fig, ax = plt.subplots(figsize=(8, 3))
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.scatter(x, infogain, alpha=0.8, s=6.0)
+    ref_nongap_mask = msa_joined != ord("-")
+    ref_coverage = np.sum(ref_nongap_mask, axis=0) / ref_nongap_mask.shape[0]
 
-    ax.set_title("Column Infogain (Alignment Order)")
+    x = np.arange(msa_joined.shape[1])
+    ax.scatter(x, ref_coverage, alpha=0.8, s=3.0, label="NCBI Refs")
+
+    otu_18s_nongap_mask = msa_18s_otu != ord("-")
+    otu_18s_coverage = np.sum(otu_18s_nongap_mask, axis=0) / otu_18s_nongap_mask.shape[0]
+
+    x = np.arange(msa_18s_otu.shape[1])
+    ax.scatter(x, otu_18s_coverage, alpha=0.8, s=3.0, label="18S OTUs")
+
+    otu_coi_nongap_mask = msa_coi_otu != ord("-")
+    otu_coi_coverage = np.sum(otu_coi_nongap_mask, axis=0) / otu_coi_nongap_mask.shape[0]
+
+    x = np.arange(gene_start_idx[1], gene_start_idx[1] + msa_coi_otu.shape[1])
+    ax.scatter(x, otu_coi_coverage, alpha=0.8, s=3.0, label="COI OTUs")
+
+    for boundry, label_left, label_right in zip(gene_start_idx, ("18S", "28S"), ("28S", "COI")):
+        ax.axvline(boundry, c="black", linewidth=0.5)
+        ax.text(
+            boundry,
+            0.99,
+            label_left,
+            color="black",
+            ha="left",
+            va="top",
+            rotation=-90,
+            transform=ax.get_xaxis_transform(),
+            size=9,
+        )
+        ax.text(
+            boundry,
+            0.99,
+            label_right,
+            color="black",
+            ha="right",
+            va="top",
+            rotation=90,
+            transform=ax.get_xaxis_transform(),
+            size=9,
+        )
+
+    ax.set_title("Column Coverage (Alignment Order)")
     ax.set_xlabel("Alignment Columns")
-    ax.set_ylabel("Infogain (bits)")
+    ax.set_ylabel("Coverage Proportion")
 
+    # ax.grid(True, linestyle="--", alpha=0.6)
+    ax.legend()
     fig.tight_layout()
     fig.savefig(outfile)
     plt.close(fig)
@@ -203,17 +254,31 @@ def main() -> None:
 
     # Load 18S alignment
     seqs_18s_ref = load_seq_dict(cfg.input_18s_ref_fasta, skbio.DNA)
-    msa_18s_index, msa_18s = create_minimal_msa(seqs_18s_ref)
+    seqs_18s_otu = load_seq_dict(cfg.input_18s_otu_fasta, skbio.DNA)
+    seqs_18s = seqs_18s_ref | seqs_18s_otu
+
+    msa_18s_index, msa_18s = create_minimal_msa(seqs_18s)
+    msa_18s_ref_index, msa_18s_ref = filter_msa(msa_18s_index, msa_18s, list(seqs_18s_ref.keys()))
+    msa_18s_otu_index, msa_18s_otu = filter_msa(msa_18s_index, msa_18s, list(seqs_18s_otu.keys()))
 
     # Load 28S alignment
     seqs_28s_ref = load_seq_dict(cfg.input_28s_ref_fasta, skbio.DNA)
-    msa_28s_index, msa_28s = create_minimal_msa(seqs_28s_ref)
+    msa_28s_ref_index, msa_28s_ref = create_minimal_msa(seqs_28s_ref)
 
     # Load COI alignment
     prot_seqs_coi = load_seq_dict(cfg.input_coi_ref_and_otu_prot_fasta, skbio.Protein)
+
     nuc_seqs_coi_ref = load_seq_dict(cfg.input_coi_ref_trimmed_fasta, skbio.DNA)
-    prot_seqs_coi_ref = {id: prot_seqs_coi[id] for id in nuc_seqs_coi_ref}
-    msa_coi_index, msa_coi = create_minimal_msa(prot_seqs_coi_ref, nuc_seqs=nuc_seqs_coi_ref)
+    nuc_seqs_coi_otu = load_seq_dict(cfg.input_coi_otu_trimmed_fasta, skbio.DNA)
+    nuc_seqs_coi = nuc_seqs_coi_ref | nuc_seqs_coi_otu
+
+    msa_coi_index, msa_coi = create_minimal_msa(prot_seqs_coi, nuc_seqs=nuc_seqs_coi)
+    msa_coi_ref_index, msa_coi_ref = filter_msa(
+        msa_coi_index, msa_coi, list(nuc_seqs_coi_ref.keys())
+    )
+    msa_coi_otu_index, msa_coi_otu = filter_msa(
+        msa_coi_index, msa_coi, list(nuc_seqs_coi_otu.keys())
+    )
 
     # Load metadata table
     df = pd.read_csv(cfg.input_metadata)
@@ -233,6 +298,7 @@ def main() -> None:
         axis=1,
     )
 
+    # Set missing voucher names to accession
     no_voucher = df.voucher_norm == ""
     df.loc[no_voucher, "voucher_norm"] = df.loc[no_voucher, "accession"]
 
@@ -254,8 +320,10 @@ def main() -> None:
         sort=False,
     ).reset_index()
 
+    # Column for the total length after matching genes to vouchers
     pivot_df["total_length"] = pivot_df.length.fillna(0).sum(axis=1)  # type: ignore
 
+    # Sort dataframe by taxonomy and total length, useful for greedy clustering later
     pivot_df = pivot_df.sort_values(
         [
             "worms_class",
@@ -267,6 +335,7 @@ def main() -> None:
         ascending=[True, True, True, True, False],
     ).reset_index(drop=True)
 
+    # Give each record a unique name based on accessions for each gene
     pivot_df["name"] = pivot_df.apply(
         lambda row: " ".join(
             [f"{gene}:{row.astype(str).accession[gene]}" for gene in ["18S", "28S", "COI"]]
@@ -277,18 +346,17 @@ def main() -> None:
     # Construct joined msa
     msa_joined, gene_start_idx = join_msas(
         pivot_df.accession,  # type: ignore
-        msa_18s,
-        msa_18s_index,
-        msa_28s,
-        msa_28s_index,
-        msa_coi,
-        msa_coi_index,
+        msa_18s_ref,
+        msa_18s_ref_index,
+        msa_28s_ref,
+        msa_28s_ref_index,
+        msa_coi_ref,
+        msa_coi_ref_index,
     )
 
-    # Set non-degenerate characters and gaps to 0
+    # Find non-degenerate characters
     bases = ("A", "C", "G", "T")
     nondegen_mask = np.isin(msa_joined, [ord(b) for b in bases])
-    msa_joined[~nondegen_mask] = 0
 
     # Find genus boundry indices
     genus_col = pivot_df.worms_genus.to_numpy()
@@ -296,15 +364,16 @@ def main() -> None:
 
     # Greedy prefer longest p-distance clustering (99%)
     keep = np.ones(len(pivot_df), dtype=bool)
-    for msa_genus, keep_genus in zip(
+    for msa_genus, nondegen_genus, keep_genus in zip(
         np.split(msa_joined, genus_start_idx, axis=0),
+        np.split(nondegen_mask, genus_start_idx, axis=0),
         np.split(keep, genus_start_idx, axis=0),
     ):
         for i in range(msa_genus.shape[0] - 1):
             if not keep_genus[i]:
                 continue
 
-            shared_nondegen = (msa_genus[i] != 0) & (msa_genus[i + 1 :] != 0)
+            shared_nondegen = nondegen_genus[i] & nondegen_genus[i + 1 :]
             mismatches = (msa_genus[i] != msa_genus[i + 1 :]) & shared_nondegen
             with np.errstate(invalid="ignore"):
                 p_dist = np.sum(mismatches, axis=1) / np.sum(shared_nondegen, axis=1)
@@ -314,6 +383,10 @@ def main() -> None:
     # Filter out redundant sequences
     pivot_df = pivot_df[keep].reset_index(drop=True)
     msa_joined = msa_joined[keep]
+    nondegen_mask = nondegen_mask[keep]
+
+    # Plot column coverage
+    plot_coverage(msa_joined, gene_start_idx, msa_18s_otu, msa_coi_otu, "column_coverage.png")
 
     # Find genus boundry indices
     genus_col = pivot_df.worms_genus.to_numpy()
@@ -351,7 +424,7 @@ def main() -> None:
     genus_entropy_std = np.full(msa_joined.shape[1], np.nan)
 
     # Minimum number of genera covering a column for infogain calculation
-    min_genera = 5
+    min_genera = 3
 
     # Calculate the global entropy, genus infogain and genus entropy standard deviation
     num_genera = np.sum(~np.isnan(genus_entropy), axis=0)
@@ -388,37 +461,52 @@ def main() -> None:
     # Plot the class to genus gainratio
     plot_infogain_boxplots(genus_gainratio, gene_start_idx, "genus_gainratio_boxplot.png")
 
-    family_col = pivot_df.worms_family.to_numpy()
-    family_start_idx = np.flatnonzero(family_col[:-1] != family_col[1:]) + 1
+    # Calculate the shared summed gainratio for all pairs
+    msa_gainratio = nondegen_mask * np.nan_to_num(genus_gainratio)
+    pair_overlap_gainratio = nondegen_mask @ msa_gainratio.T
 
-    all_summed_gainratio = np.full(len(pivot_df), np.nan)
-    family_overlap_gainratio = np.full(len(pivot_df), np.nan)
-    for msa_family, overlap_gainratio, summed_gainratio in zip(
-        np.split(msa_joined, family_start_idx, axis=0),
-        np.split(family_overlap_gainratio, family_start_idx, axis=0),
-        np.split(all_summed_gainratio, family_start_idx, axis=0),
-    ):
-        nondegen = msa_family != 0
-        msa_gainratio = nondegen * np.nan_to_num(genus_gainratio)
+    # The diagonals are the summed gainratio of each record
+    summed_gainratio = np.diagonal(pair_overlap_gainratio).copy()
+    np.fill_diagonal(pair_overlap_gainratio, np.nan)
 
-        pairwise_overlap_gainratio = nondegen @ msa_gainratio.T
+    # Calculate the mean overlap for each record with all others
+    mean_overlap_gainratio = np.nanmean(pair_overlap_gainratio, axis=0)
 
-        summed_gainratio[:] = np.diagonal(pairwise_overlap_gainratio)
-        overlap_gainratio[:] = np.mean(pairwise_overlap_gainratio, axis=0)
+    pivot_df["summed_gainratio"] = summed_gainratio
+    pivot_df["mean_overlap_gainratio"] = mean_overlap_gainratio
 
-    pivot_df["summed_gainratio"] = all_summed_gainratio
-    pivot_df["family_overlap_gainratio"] = family_overlap_gainratio
-
-    family_max = pivot_df.groupby("worms_genus").family_overlap_gainratio.transform("max")
-    genus_rep = (pivot_df.family_overlap_gainratio > 0.9 * family_max) & (
-        pivot_df.summed_gainratio > 100
+    # Genus representative records should have high mean overlap and a mininum summed gainratio
+    genus_max = pivot_df.groupby("worms_genus", sort=False).mean_overlap_gainratio.transform("max")
+    genus_rep = (pivot_df.mean_overlap_gainratio > cfg.overlap_gainratio_frac * genus_max) & (
+        pivot_df.summed_gainratio > cfg.min_summed_gainratio
     )
 
-    pivot_df = pivot_df[genus_rep]
+    # Keep only genus representatives
+    pivot_df = pivot_df[genus_rep].reset_index(drop=True)
+    msa_joined = msa_joined[genus_rep]
 
+    # Save genus representatives metadata
     pivot_df.to_csv(cfg.output_metadata)
 
-    breakpoint()
+    # Save genus representatives alignment
+    seq_records = [skbio.DNA(row) for row in msa_joined]
+    newick_compat = str.maketrans({" ": "_", "(": "", ")": "", ":": ""})
+    with open(cfg.output_fasta, "w") as f:
+        f.writelines(
+            f">{name.translate(newick_compat)}\n{seq}\n"
+            for name, seq in zip(pivot_df.name, seq_records)
+        )
+
+    # Save alignment partition file for RAxML-NG
+    with open(cfg.output_partition, "w") as f:
+        f.write(f"{cfg.partition_model}, 18S = {1}-{gene_start_idx[0]}\n")
+        f.write(f"{cfg.partition_model}, 28S = {gene_start_idx[0] + 1}-{gene_start_idx[1]}\n")
+        f.write(
+            f"{cfg.partition_model}, COI_12 = {gene_start_idx[1] + 1}-{msa_joined.shape[1]}\\3, {gene_start_idx[1] + 2}-{msa_joined.shape[1]}\\3\n"
+        )
+        f.write(
+            f"{cfg.partition_model}, COI_3 = {gene_start_idx[1] + 3}-{msa_joined.shape[1]}\\3\n"
+        )
 
 
 if __name__ == "__main__":
