@@ -28,66 +28,66 @@ class Config:
 
 
 def plot_coverage(
-    msa_joined: np.ndarray,
+    coverage_ref: np.ndarray,
+    coverage_18s_otu: np.ndarray,
+    coverage_coi_otu: np.ndarray,
+    genus_gainratio: np.ndarray,
     gene_start_idx: np.ndarray,
-    msa_18s_otu: np.ndarray,
-    msa_coi_otu: np.ndarray,
     outfile: str,
 ):
-    fig, ax = plt.subplots(figsize=(8, 3))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 5), sharex=True, sharey=True)  # type: ignore
 
-    ref_nongap_mask = msa_joined != ord("-")
-    ref_coverage = np.sum(ref_nongap_mask, axis=0) / ref_nongap_mask.shape[0]
-    ref_coverage[ref_coverage == 0.0] = np.nan
+    x = np.arange(coverage_ref.shape[0])
 
-    x = np.arange(msa_joined.shape[1])
-    ax.scatter(x, ref_coverage, alpha=0.8, s=2.0, label="NCBI Refs")
+    coverage_ref = coverage_ref.copy()
+    coverage_ref[coverage_ref == 0.0] = np.nan
 
-    otu_18s_nongap_mask = msa_18s_otu != ord("-")
-    otu_18s_coverage = np.sum(otu_18s_nongap_mask, axis=0) / otu_18s_nongap_mask.shape[0]
-    otu_18s_coverage[otu_18s_coverage == 0.0] = np.nan
+    coverage_18s_otu = coverage_18s_otu.copy()
+    coverage_18s_otu[coverage_18s_otu == 0.0] = np.nan
 
-    x = np.arange(msa_18s_otu.shape[1])
-    ax.scatter(x, otu_18s_coverage, alpha=0.8, s=2.0, label="18S OTUs")
+    coverage_coi_otu = coverage_coi_otu.copy()
+    coverage_coi_otu[coverage_coi_otu == 0.0] = np.nan
 
-    otu_coi_nongap_mask = msa_coi_otu != ord("-")
-    otu_coi_coverage = np.sum(otu_coi_nongap_mask, axis=0) / otu_coi_nongap_mask.shape[0]
-    otu_coi_coverage[otu_coi_coverage == 0.0] = np.nan
+    ax1.scatter(x, coverage_ref, alpha=0.8, s=2.0, label="NCBI Refs")
+    ax1.scatter(x, coverage_18s_otu, alpha=0.8, s=2.0, label="18S OTUs")
+    ax1.scatter(x, coverage_coi_otu, alpha=0.8, s=2.0, label="COI OTUs")
 
-    x = np.arange(gene_start_idx[1], gene_start_idx[1] + msa_coi_otu.shape[1])
-    ax.scatter(x, otu_coi_coverage, alpha=0.8, s=2.0, label="COI OTUs")
+    ax2.scatter(x, genus_gainratio, alpha=0.8, s=2.0, label="Genus Gainratio")
 
     for boundry, label_left, label_right in zip(gene_start_idx, ("18S", "28S"), ("28S", "COI")):
-        ax.axvline(boundry, c="black", linewidth=0.5)
-        ax.text(
-            boundry,
-            0.99,
-            label_right,
-            color="black",
-            ha="left",
-            va="top",
-            rotation=-90,
-            transform=ax.get_xaxis_transform(),
-            size=9,
-        )
-        ax.text(
-            boundry,
-            0.99,
-            label_left,
-            color="black",
-            ha="right",
-            va="top",
-            rotation=90,
-            transform=ax.get_xaxis_transform(),
-            size=9,
-        )
+        for ax in (ax1, ax2):
+            ax.axvline(boundry, c="black", linewidth=0.5)
+            ax.text(
+                boundry,
+                0.99,
+                label_right,
+                color="black",
+                ha="left",
+                va="top",
+                rotation=-90,
+                transform=ax.get_xaxis_transform(),
+                size=9,
+            )
+            ax.text(
+                boundry,
+                0.99,
+                label_left,
+                color="black",
+                ha="right",
+                va="top",
+                rotation=90,
+                transform=ax.get_xaxis_transform(),
+                size=9,
+            )
 
-    ax.set_title("Column Coverage (Alignment Order)")
-    ax.set_xlabel("Alignment Columns")
-    ax.set_ylabel("Coverage Proportion")
+    ax1.set_title("Column Coverage")
+    ax1.set_ylabel("Coverage Proportion")
+    ax1.legend()
 
-    # ax.grid(True, linestyle="--", alpha=0.6)
-    ax.legend()
+    ax2.set_title("Genus Split Gain Ratio")
+    ax2.set_xlabel("Alignment Columns")
+    ax2.set_ylabel("Gain Ratio")
+
     fig.tight_layout()
     fig.savefig(outfile)
     plt.close(fig)
@@ -421,9 +421,6 @@ def main() -> None:
     msa_joined = msa_joined[keep]
     nondegen_mask = nondegen_mask[keep]
 
-    # Plot column coverage
-    plot_coverage(msa_joined, gene_start_idx, msa_18s_otu, msa_coi_otu, "column_coverage.png")
-
     # Find genus boundry indices
     genus_col = pivot_df.worms_genus.to_numpy()
     genus_start_idx = np.flatnonzero(genus_col[:-1] != genus_col[1:]) + 1
@@ -497,19 +494,47 @@ def main() -> None:
     # Plot the class to genus gainratio
     plot_infogain_boxplots(genus_gainratio, gene_start_idx, "genus_gainratio_boxplot.png")
 
+    # Calculate the coverage profiles for the reference and otu alignments
+    coverage_ref = np.sum(nondegen_mask, axis=0) / nondegen_mask.shape[0]
+    coverage_18s_otu, coverage_coi_otu = np.zeros_like(coverage_ref), np.zeros_like(coverage_ref)
+    coverage_18s_otu[: gene_start_idx[0]] = (
+        np.sum(np.isin(msa_18s_otu, [ord(b) for b in bases]), axis=0) / msa_18s_otu.shape[0]
+    )
+    coverage_coi_otu[gene_start_idx[1] :] = (
+        np.sum(np.isin(msa_coi_otu, [ord(b) for b in bases]), axis=0) / msa_coi_otu.shape[0]
+    )
+
+    # Plot column coverage and genus gainratio
+    plot_coverage(
+        coverage_ref,
+        coverage_18s_otu,
+        coverage_coi_otu,
+        genus_gainratio,
+        gene_start_idx,
+        "column_coverage.png",
+    )
+
     # Calculate the shared summed gainratio for all pairs
+
+    genus_gainratio_zeroed = np.nan_to_num(genus_gainratio)
+
+    ref_gainratio = np.sum(genus_gainratio_zeroed * coverage_ref)
+    otu_18s_gainratio = np.sum(genus_gainratio_zeroed * coverage_18s_otu)
+    otu_coi_gainratio = np.sum(genus_gainratio_zeroed * coverage_coi_otu)
+
     msa_gainratio = nondegen_mask * np.nan_to_num(genus_gainratio)
-    pair_overlap_gainratio = nondegen_mask @ msa_gainratio.T
 
-    # The diagonals are the summed gainratio of each record
-    summed_gainratio = np.diagonal(pair_overlap_gainratio).copy()
-    np.fill_diagonal(pair_overlap_gainratio, np.nan)
+    pivot_df["ref_gainratio_fraction"] = (
+        np.sum(msa_gainratio * coverage_ref, axis=1) / ref_gainratio
+    )
+    pivot_df["otu_18s_gainratio_fraction"] = (
+        np.sum(msa_gainratio * coverage_18s_otu, axis=1) / otu_18s_gainratio
+    )
+    pivot_df["otu_coi_gainratio_fraction"] = (
+        np.sum(msa_gainratio * coverage_coi_otu, axis=1) / otu_coi_gainratio
+    )
 
-    # Calculate the mean overlap for each record with all others
-    mean_overlap_gainratio = np.nanmean(pair_overlap_gainratio, axis=0)
-
-    pivot_df["summed_gainratio"] = summed_gainratio
-    pivot_df["mean_overlap_gainratio"] = mean_overlap_gainratio
+    breakpoint()
 
     # Genus representative records should have high mean overlap and a mininum summed gainratio
     genus_max = pivot_df.groupby("worms_genus", sort=False).mean_overlap_gainratio.transform("max")
