@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import skbio
-from src.common import parse_config
+from common import parse_config
 
 
 @dataclass
@@ -20,12 +20,13 @@ def main() -> None:
     with open(cfg.output_fasta, "w") as f:
         seq: skbio.RNA
         for seq in skbio.read(cfg.input_fasta, format="fasta", constructor=skbio.RNA):
-            id = seq.metadata["id"]
             fields = seq.metadata["description"].split(";")[-1].split()
             hyp_genus = fields[0]
-            hyp_species = " ".join(fields[:2]) if len(fields) > 1 else None
 
-            f.write(f">SILVA|{id} {hyp_genus};{hyp_species}\n{seq}\n")
+            dna_seq = seq.reverse_transcribe()
+            dna_seq = dna_seq.replace(dna_seq.gaps(), "-")
+
+            f.write(f">{hyp_genus}\n{dna_seq}\n")
             count += 1
 
     print(f"Writing {count} SILVA Nematode records to fasta file")

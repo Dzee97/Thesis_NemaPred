@@ -9,6 +9,7 @@ PROJECT_DATA_DIR = RAW_DATA_DIR / "Project_data_Nematode_traits"
 SILVA_DATA_DIR = RAW_DATA_DIR / "SILVA"
 PROCESSED_DATA_DIR = DATA_DIR / "processed"
 
+MODELTEST_DATA_DIR = PROCESSED_DATA_DIR / "modeltest"
 RAXML_DATA_DIR = PROCESSED_DATA_DIR / "raxml"
 PASTML_DATA_DIR = PROCESSED_DATA_DIR / "pastml"
 
@@ -173,11 +174,20 @@ rule align_coi_otus:
     shell:
         "mafft --6merpair --addfragments {input.input_otu_fasta} --preservecase {input.input_ref_fasta} > {output.output_fasta}"
 
+rule create_outgroup_fasta:
+    input:
+        input_fasta = SILVA_DATA_DIR /  "Outgroup_18S.fasta"
+    output:
+        output_fasta = PROCESSED_DATA_DIR / "Outgroup_18S.fasta"
+    script:
+        "scripts/preprocess_silva.py"
+
 rule process_alignments:
     input:
         input_metadata = PROCESSED_DATA_DIR / "NCBI_metadata.csv",
         input_18s_ref_fasta = PROCESSED_DATA_DIR / "NCBI_18S_aligned.fasta",
         input_18s_otu_fasta = PROCESSED_DATA_DIR / "OTUs_18S_aligned.fasta",
+        input_18s_outgroup_fasta = PROCESSED_DATA_DIR /  "Outgroup_18S.fasta",
         input_28s_ref_fasta = PROCESSED_DATA_DIR / "NCBI_28S_aligned.fasta",
         input_coi_ref_and_otu_prot_fasta = PROCESSED_DATA_DIR / "NCBI_COI_with_OTUs_prot_aligned.fasta",
         input_coi_ref_trimmed_fasta = PROCESSED_DATA_DIR / "NCBI_COI_trimmed.fasta",
@@ -185,55 +195,49 @@ rule process_alignments:
     params:
         overlap_gainratio_frac = 0.8,
         min_summed_gainratio = 100,
-        partition_model = "GTR+G"
+        partition_model = "DNA"
     output:
         output_fasta = PROCESSED_DATA_DIR / "Filtered_alignment.fasta",
         output_metadata = PROCESSED_DATA_DIR / "Filtered_metadata.csv",
-        output_partition = PROCESSED_DATA_DIR / "Filtered_alignment.partition"
+        output_partition = PROCESSED_DATA_DIR / "Filtered_alignment.partition",
+        output_outgroup = PROCESSED_DATA_DIR / "Filtered_alignment.outgroup"
     script:
         "scripts/process_alignments2.py"
 
-rule create_candidate_tree:
+rule select_partition_model:
     input:
         input_fasta = PROCESSED_DATA_DIR / "Filtered_alignment.fasta",
         input_partition = PROCESSED_DATA_DIR / "Filtered_alignment.partition"
     params:
-        raxml_dir = RAXML_DATA_DIR,
-        prefix_final = RAXML_DATA_DIR  / "Candidate_tree",
+        modeltest_dir = MODELTEST_DATA_DIR,
+        prefix = MODELTEST_DATA_DIR / "Modeltest"
     output:
-        out_best_tree = RAXML_DATA_DIR / "Candidate_tree.raxml.bestTree"
+        output_bic_partition = MODELTEST_DATA_DIR / "Modeltest.part.bic"
     shell:
         """
-        mkdir -p {params.raxml_dir}
-        raxml-ng --msa {input.input_fasta} --model {input.input_partition} --prefix {params.prefix_final} --seed {SEED}
+        mkdir -p {params.modeltest_dir}
+        modeltest-ng -i {input.input_fasta} -q {input.input_partition} -o {params.prefix} -r {SEED} -p 4
         """
 
-rule representative_selection:
+rule create_tree:
     input:
         input_fasta = PROCESSED_DATA_DIR / "Filtered_alignment.fasta",
-        input_tree = RAXML_DATA_DIR / "Candidate_tree.raxml.bestTree",
-        input_metadata = PROCESSED_DATA_DIR / "Filtered_metadata.csv"
-    output:
-        output_fasta = PROCESSED_DATA_DIR / "Representative_alignment.fasta",
-    script:
-        "scripts/representative_selection.py"
-
-rule create_representative_tree:
-    input:
-        input_fasta = PROCESSED_DATA_DIR / "Representative_alignment.fasta",
-        input_partition = PROCESSED_DATA_DIR / "Filtered_alignment.partition"
+        input_bic_partition = MODELTEST_DATA_DIR / "Modeltest.part.bic",
+        input_outgroup = PROCESSED_DATA_DIR / "Filtered_alignment.outgroup"
     params:
         raxml_dir = RAXML_DATA_DIR,
-        prefix_final = RAXML_DATA_DIR  / "Representative_tree",
+        prefix = RAXML_DATA_DIR  / "Tree",
         pars_trees = 100,
-        rand_trees = 100
+        rand_trees = 100,
+        bs_trees = 1000
     output:
-        out_best_tree = RAXML_DATA_DIR / "Representative_tree.raxml.support"
+        out_best_tree = RAXML_DATA_DIR / "Tree.raxml.bestTree"
     shell:
         """
         mkdir -p {params.raxml_dir}
-        raxml-ng --all --msa {input.input_fasta} --model {input.input_partition} --prefix {params.prefix_final} --seed {SEED} --tree pars{{{params.pars_trees}}},rand{{{params.rand_trees}}}
+        raxml-ng --all --msa {input.input_fasta} --model {input.input_bic_partition} --prefix {params.prefix} --seed {SEED} --tree pars{{{params.pars_trees}}},rand{{{params.rand_trees}}} --outgroup $(cat {input.input_outgroup}) --bs-trees {params.bs_trees}
         """
+
 
 # OLD METHOD
 

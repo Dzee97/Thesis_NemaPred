@@ -7,6 +7,7 @@ import pandas as pd
 import skbio
 from common import parse_config
 from scipy.stats import entropy as calc_entropy
+from sklearn.metrics import silhouette_samples
 from tqdm import tqdm
 
 
@@ -15,6 +16,7 @@ class Config:
     input_metadata: Path
     input_18s_ref_fasta: Path
     input_18s_otu_fasta: Path
+    input_18s_outgroup_fasta: Path
     input_28s_ref_fasta: Path
     input_coi_ref_and_otu_prot_fasta: Path
     input_coi_ref_trimmed_fasta: Path
@@ -25,6 +27,7 @@ class Config:
     output_fasta: Path
     output_metadata: Path
     output_partition: Path
+    output_outgroup: Path
 
 
 def plot_coverage(
@@ -274,24 +277,31 @@ def main() -> None:
     cfg = parse_config(Config, snakemake)
 
     # Load 18S alignment
+    print("Loading 18S alignment...")
     seqs_18s_ref = load_seq_dict(cfg.input_18s_ref_fasta, skbio.DNA)
     seqs_18s_otu = load_seq_dict(cfg.input_18s_otu_fasta, skbio.DNA)
+    seqs_18s_outgroup = load_seq_dict(cfg.input_18s_outgroup_fasta, skbio.DNA)
 
     msa_18s_otu_index, msa_18s_otu = create_minimal_msa(seqs_18s_otu)
     valid_18s_otu_ids = filter_otu_outliers(msa_18s_otu_index, msa_18s_otu)
 
     seqs_18s_otu = {id: seqs_18s_otu[id] for id in valid_18s_otu_ids}
-    seqs_18s = seqs_18s_ref | seqs_18s_otu
+    seqs_18s = seqs_18s_ref | seqs_18s_otu | seqs_18s_outgroup
 
     msa_18s_index, msa_18s = create_minimal_msa(seqs_18s)
     msa_18s_ref_index, msa_18s_ref = filter_msa(msa_18s_index, msa_18s, list(seqs_18s_ref.keys()))
     msa_18s_otu_index, msa_18s_otu = filter_msa(msa_18s_index, msa_18s, list(seqs_18s_otu.keys()))
+    msa_18s_outgroup_index, msa_18s_outgroup = filter_msa(
+        msa_18s_index, msa_18s, list(seqs_18s_outgroup.keys())
+    )
 
     # Load 28S alignment
+    print("Loading 28S alignment...")
     seqs_28s_ref = load_seq_dict(cfg.input_28s_ref_fasta, skbio.DNA)
     msa_28s_ref_index, msa_28s_ref = create_minimal_msa(seqs_28s_ref)
 
     # Load COI alignment
+    print("Loading COI alignment...")
     nuc_seqs_coi_ref = load_seq_dict(cfg.input_coi_ref_trimmed_fasta, skbio.DNA)
     nuc_seqs_coi_otu = load_seq_dict(cfg.input_coi_otu_trimmed_fasta, skbio.DNA)
 
@@ -317,6 +327,7 @@ def main() -> None:
     )
 
     # Load metadata table
+    print("Loading Metadata Table")
     df = pd.read_csv(cfg.input_metadata)
 
     # Normalize voucher names
@@ -339,6 +350,7 @@ def main() -> None:
     df.loc[no_voucher, "voucher_norm"] = df.loc[no_voucher, "accession"]
 
     # Pivot the table by shared voucher
+    print("Combine records with shared voucher")
     pivot_df = df.pivot_table(
         index=[
             "worms_class",
@@ -383,6 +395,7 @@ def main() -> None:
     )
 
     # Construct joined msa
+    print("Construct Joined MSA")
     msa_joined, gene_start_idx = join_msas(
         pivot_df.accession,  # type: ignore
         msa_18s_ref,
@@ -402,11 +415,15 @@ def main() -> None:
     genus_start_idx = np.flatnonzero(genus_col[:-1] != genus_col[1:]) + 1
 
     # Greedy prefer longest p-distance clustering (99%)
+    print("Genus Greedy Proportion Distance Clustering (99%)")
     keep = np.ones(len(pivot_df), dtype=bool)
-    for msa_genus, nondegen_genus, keep_genus in zip(
-        np.split(msa_joined, genus_start_idx, axis=0),
-        np.split(nondegen_mask, genus_start_idx, axis=0),
-        np.split(keep, genus_start_idx, axis=0),
+    for msa_genus, nondegen_genus, keep_genus in tqdm(
+        zip(
+            np.split(msa_joined, genus_start_idx, axis=0),
+            np.split(nondegen_mask, genus_start_idx, axis=0),
+            np.split(keep, genus_start_idx, axis=0),
+        ),
+        total=genus_start_idx.shape[0] + 1,
     ):
         for i in range(msa_genus.shape[0] - 1):
             if not keep_genus[i]:
@@ -439,12 +456,14 @@ def main() -> None:
     min_seqs = 5
 
     # Loop over genera, calculate their nucleotide probabilities and entropies
+    print("Calculating Genus Site Probabilities + Entropy")
     for msa_genus, probs, entropy in tqdm(
         zip(
             np.split(msa_joined, genus_start_idx, axis=0),
             genus_probs,
             genus_entropy,
-        )
+        ),
+        total=genus_start_idx.shape[0] + 1,
     ):
         base_counts = np.vstack([np.sum(msa_genus == ord(b), axis=0) for b in bases]) + alpha
         base_total = np.sum(base_counts, axis=0)
@@ -463,6 +482,7 @@ def main() -> None:
     min_genera = 3
 
     # Calculate the global entropy, genus infogain and genus entropy standard deviation
+    print("Calculating Global Entropy, Genus Infogain and Genus Gainratio")
     num_genera = np.sum(~np.isnan(genus_entropy), axis=0)
     num_genera_mask = num_genera >= min_genera
 
@@ -498,6 +518,7 @@ def main() -> None:
     plot_infogain_boxplots(genus_gainratio, gene_start_idx, "genus_gainratio_boxplot.png")
 
     # Calculate the coverage profiles for the reference and otu alignments
+    print("Calcualting Coverage Profiles")
     coverage_ref = np.sum(nondegen_mask, axis=0) / nondegen_mask.shape[0]
     coverage_18s_otu, coverage_coi_otu = np.zeros_like(coverage_ref), np.zeros_like(coverage_ref)
     coverage_18s_otu[: gene_start_idx[0]] = (
@@ -517,8 +538,8 @@ def main() -> None:
         "column_coverage.png",
     )
 
-    # Calculate the shared summed gainratio for all pairs
-
+    # Calculate the shared summed information for all pairs
+    print("Calculating Average Shared Information")
     genus_gainratio_zeroed = np.nan_to_num(genus_gainratio)
 
     ref_info = np.sum(genus_gainratio_zeroed * coverage_ref)
@@ -532,29 +553,80 @@ def main() -> None:
     pivot_df["otu_coi_info_fraction"] = np.sum(msa_info * coverage_coi_otu, axis=1) / otu_coi_info
 
     # Genus representative records should have high mean overlap and a mininum summed gainratio
-    high_otu_18s_info = pivot_df.otu_18s_info_fraction > 0.7
+    high_otu_18s_info = pivot_df.otu_18s_info_fraction > 0.6
     pivot_df = pivot_df[high_otu_18s_info].reset_index(drop=True)
     msa_joined = msa_joined[high_otu_18s_info]
+    nondegen_mask = nondegen_mask[high_otu_18s_info]
 
-    genus_ref_info_max = pivot_df.groupby("worms_genus", sort=False).ref_info_fraction.transform(
-        "max"
-    )
-    genus_ref_info_high = pivot_df.ref_info_fraction > genus_ref_info_max - 0.1
-    pivot_df = pivot_df[genus_ref_info_high].reset_index(drop=True)
-    msa_joined = msa_joined[genus_ref_info_high]
+    # Find family outliers
+    print("Filtering Family Proportion Distance Outliers")
+    genus_col = pivot_df.worms_genus.to_numpy()
+    family_col = pivot_df.worms_family.to_numpy()
+    order_col = pivot_df.worms_order.to_numpy()
+    order_start_idx = np.flatnonzero(order_col[:-1] != order_col[1:]) + 1
+    silhouette_scores = np.full(len(pivot_df), np.nan)
+    for msa_order, nondegen_order, genus_order, family_order, silhouette in tqdm(
+        zip(
+            np.split(msa_joined, order_start_idx, axis=0),
+            np.split(nondegen_mask, order_start_idx, axis=0),
+            np.split(genus_col, order_start_idx, axis=0),
+            np.split(family_col, order_start_idx, axis=0),
+            np.split(silhouette_scores, order_start_idx, axis=0),
+        ),
+        total=order_start_idx.shape[0] + 1,
+    ):
+        p_dist = np.empty((msa_order.shape[0], msa_order.shape[0]))
+        for i in range(msa_order.shape[0]):
+            shared_nondegen = nondegen_order[i] & nondegen_order
+            mismatches = (msa_order[i] != msa_order) & shared_nondegen
+            with np.errstate(invalid="ignore"):
+                p_dist[i] = np.sum(
+                    mismatches * genus_gainratio_zeroed * coverage_18s_otu, axis=1
+                ) / np.sum(shared_nondegen * genus_gainratio_zeroed * coverage_18s_otu, axis=1)
 
-    # Report number of surviving genera
-    print(f"Num Genera: {pivot_df.worms_genus.nunique()}")
-    print(f"Trait Genera: {pivot_df[pivot_df.trait_genus].worms_genus.nunique()}")
+        genus_start_idx = np.flatnonzero(genus_order[:-1] != genus_order[1:]) + 1
+        genus_start_idx = np.concat(([0], genus_start_idx, [genus_order.shape[0]]))
+        genus_size = genus_start_idx[1:] - genus_start_idx[:-1]
+        genus_size = np.repeat(genus_size, genus_size)
+
+        sil = np.asarray(silhouette_samples(p_dist, family_order, metric="precomputed"))
+        sil_genus = np.asarray(silhouette_samples(p_dist, genus_order, metric="precomputed"))
+
+        sil[genus_size > 2] = sil_genus[genus_size > 2]
+
+        silhouette[:] = sil
+
+    pivot_df["silhouette"] = silhouette_scores
+    pivot_df["rep_score"] = pivot_df.ref_info_fraction + pivot_df.silhouette.fillna(0)
 
     # Save genus representatives metadata
+    rep_idx = pivot_df[pivot_df.trait_genus].groupby("worms_genus").rep_score.idxmax()
+
+    pivot_df["genus_rep"] = False
+    pivot_df.loc[rep_idx, "genus_rep"] = True
     pivot_df.to_csv(cfg.output_metadata, index=False)
 
+    rep_df = pivot_df.loc[rep_idx]
+
+    # Report number of surviving genera
+    print(f"Num Genera: {rep_df.worms_genus.nunique()}")
+
     # Save genus representatives alignment
-    seq_records = [skbio.DNA(row) for row in msa_joined]
+    msa_joined = msa_joined[rep_df.index.to_numpy()]
+    ref_seq_records = [skbio.DNA(row) for row in msa_joined]
+
+    msa_joined_outgroup = np.full(
+        (msa_18s_outgroup.shape[0], msa_joined.shape[1]), ord("-"), dtype=np.uint8
+    )
+    msa_joined_outgroup[:, : gene_start_idx[0]] = msa_18s_outgroup
+    outgroup_seq_records = [skbio.DNA(row) for row in msa_joined_outgroup]
 
     with open(cfg.output_fasta, "w") as f:
-        f.writelines(f">{name}\n{seq}\n" for name, seq in zip(pivot_df.name, seq_records))
+        f.writelines(f">{name}\n{seq}\n" for name, seq in zip(rep_df.worms_genus, ref_seq_records))
+        f.writelines(
+            f">{name}\n{outgroup_seq_records[idx]}\n"
+            for name, idx in msa_18s_outgroup_index.items()
+        )
 
     # Save alignment partition file for RAxML-NG
     with open(cfg.output_partition, "w") as f:
@@ -566,6 +638,10 @@ def main() -> None:
         f.write(
             f"{cfg.partition_model}, COI_3 = {gene_start_idx[1] + 3}-{msa_joined.shape[1]}\\3\n"
         )
+
+    # Save outgroup names
+    with open(cfg.output_outgroup, "w") as f:
+        f.write(",".join(msa_18s_outgroup_index.keys()))
 
 
 if __name__ == "__main__":
