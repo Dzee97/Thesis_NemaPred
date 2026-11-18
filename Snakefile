@@ -193,6 +193,48 @@ rule process_alignments:
     script:
         "scripts/process_alignments2.py"
 
+rule create_candidate_tree:
+    input:
+        input_fasta = PROCESSED_DATA_DIR / "Filtered_alignment.fasta",
+        input_partition = PROCESSED_DATA_DIR / "Filtered_alignment.partition"
+    params:
+        raxml_dir = RAXML_DATA_DIR,
+        prefix_final = RAXML_DATA_DIR  / "Candidate_tree",
+    output:
+        out_best_tree = RAXML_DATA_DIR / "Candidate_tree.raxml.bestTree"
+    shell:
+        """
+        mkdir -p {params.raxml_dir}
+        raxml-ng --msa {input.input_fasta} --model {input.input_partition} --prefix {params.prefix_final} --seed {SEED}
+        """
+
+rule representative_selection:
+    input:
+        input_fasta = PROCESSED_DATA_DIR / "Filtered_alignment.fasta",
+        input_tree = RAXML_DATA_DIR / "Candidate_tree.raxml.bestTree",
+        input_metadata = PROCESSED_DATA_DIR / "Filtered_metadata.csv"
+    output:
+        output_fasta = PROCESSED_DATA_DIR / "Representative_alignment.fasta",
+    script:
+        "scripts/representative_selection.py"
+
+rule create_representative_tree:
+    input:
+        input_fasta = PROCESSED_DATA_DIR / "Representative_alignment.fasta",
+        input_partition = PROCESSED_DATA_DIR / "Filtered_alignment.partition"
+    params:
+        raxml_dir = RAXML_DATA_DIR,
+        prefix_final = RAXML_DATA_DIR  / "Representative_tree",
+        pars_trees = 100,
+        rand_trees = 100
+    output:
+        out_best_tree = RAXML_DATA_DIR / "Representative_tree.raxml.support"
+    shell:
+        """
+        mkdir -p {params.raxml_dir}
+        raxml-ng --all --msa {input.input_fasta} --model {input.input_partition} --prefix {params.prefix_final} --seed {SEED} --tree pars{{{params.pars_trees}}},rand{{{params.rand_trees}}}
+        """
+
 # OLD METHOD
 
 # rule create_18s_ncbi_fasta:

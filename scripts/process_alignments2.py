@@ -372,10 +372,13 @@ def main() -> None:
     ).reset_index(drop=True)
 
     # Give each record a unique name based on accessions for each gene
+    newick_compat = str.maketrans({" ": "_", "(": "", ")": "", ":": ""})
     pivot_df["name"] = pivot_df.apply(
-        lambda row: " ".join(
-            [f"{gene}:{row.astype(str).accession[gene]}" for gene in ["18S", "28S", "COI"]]
-        ),
+        lambda row: (
+            row.worms_genus
+            + "_"
+            + "_".join([f"{gene}-{row.accession[gene]!s}" for gene in ["18S", "28S", "COI"]])
+        ).str.translate(newick_compat),
         axis=1,
     )
 
@@ -518,45 +521,40 @@ def main() -> None:
 
     genus_gainratio_zeroed = np.nan_to_num(genus_gainratio)
 
-    ref_gainratio = np.sum(genus_gainratio_zeroed * coverage_ref)
-    otu_18s_gainratio = np.sum(genus_gainratio_zeroed * coverage_18s_otu)
-    otu_coi_gainratio = np.sum(genus_gainratio_zeroed * coverage_coi_otu)
+    ref_info = np.sum(genus_gainratio_zeroed * coverage_ref)
+    otu_18s_info = np.sum(genus_gainratio_zeroed * coverage_18s_otu)
+    otu_coi_info = np.sum(genus_gainratio_zeroed * coverage_coi_otu)
 
-    msa_gainratio = nondegen_mask * np.nan_to_num(genus_gainratio)
+    msa_info = nondegen_mask * np.nan_to_num(genus_gainratio)
 
-    pivot_df["ref_gainratio_fraction"] = (
-        np.sum(msa_gainratio * coverage_ref, axis=1) / ref_gainratio
-    )
-    pivot_df["otu_18s_gainratio_fraction"] = (
-        np.sum(msa_gainratio * coverage_18s_otu, axis=1) / otu_18s_gainratio
-    )
-    pivot_df["otu_coi_gainratio_fraction"] = (
-        np.sum(msa_gainratio * coverage_coi_otu, axis=1) / otu_coi_gainratio
-    )
-
-    breakpoint()
+    pivot_df["ref_info_fraction"] = np.sum(msa_info * coverage_ref, axis=1) / ref_info
+    pivot_df["otu_18s_info_fraction"] = np.sum(msa_info * coverage_18s_otu, axis=1) / otu_18s_info
+    pivot_df["otu_coi_info_fraction"] = np.sum(msa_info * coverage_coi_otu, axis=1) / otu_coi_info
 
     # Genus representative records should have high mean overlap and a mininum summed gainratio
-    genus_max = pivot_df.groupby("worms_genus", sort=False).mean_overlap_gainratio.transform("max")
-    genus_rep = (pivot_df.mean_overlap_gainratio > cfg.overlap_gainratio_frac * genus_max) & (
-        pivot_df.summed_gainratio > cfg.min_summed_gainratio
-    )
+    high_otu_18s_info = pivot_df.otu_18s_info_fraction > 0.7
+    pivot_df = pivot_df[high_otu_18s_info].reset_index(drop=True)
+    msa_joined = msa_joined[high_otu_18s_info]
 
-    # Keep only genus representatives
-    pivot_df = pivot_df[genus_rep].reset_index(drop=True)
-    msa_joined = msa_joined[genus_rep]
+    genus_ref_info_max = pivot_df.groupby("worms_genus", sort=False).ref_info_fraction.transform(
+        "max"
+    )
+    genus_ref_info_high = pivot_df.ref_info_fraction > genus_ref_info_max - 0.1
+    pivot_df = pivot_df[genus_ref_info_high].reset_index(drop=True)
+    msa_joined = msa_joined[genus_ref_info_high]
+
+    # Report number of surviving genera
+    print(f"Num Genera: {pivot_df.worms_genus.nunique()}")
+    print(f"Trait Genera: {pivot_df[pivot_df.trait_genus].worms_genus.nunique()}")
 
     # Save genus representatives metadata
-    pivot_df.to_csv(cfg.output_metadata)
+    pivot_df.to_csv(cfg.output_metadata, index=False)
 
     # Save genus representatives alignment
     seq_records = [skbio.DNA(row) for row in msa_joined]
-    newick_compat = str.maketrans({" ": "_", "(": "", ")": "", ":": ""})
+
     with open(cfg.output_fasta, "w") as f:
-        f.writelines(
-            f">{name.translate(newick_compat)}\n{seq}\n"
-            for name, seq in zip(pivot_df.name, seq_records)
-        )
+        f.writelines(f">{name}\n{seq}\n" for name, seq in zip(pivot_df.name, seq_records))
 
     # Save alignment partition file for RAxML-NG
     with open(cfg.output_partition, "w") as f:
