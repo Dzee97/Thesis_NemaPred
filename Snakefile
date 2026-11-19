@@ -12,6 +12,7 @@ PROCESSED_DATA_DIR = DATA_DIR / "processed"
 MODELTEST_DATA_DIR = PROCESSED_DATA_DIR / "modeltest"
 RAXML_DATA_DIR = PROCESSED_DATA_DIR / "raxml"
 PASTML_DATA_DIR = PROCESSED_DATA_DIR / "pastml"
+PEM_DATA_DIR = PROCESSED_DATA_DIR / "pem"
 
 OUTPUT_DIR = Path(config["project"]["output_dir"])
 LOG_DIR = Path(config["project"]["log_dir"])
@@ -237,6 +238,29 @@ rule create_tree:
         mkdir -p {params.raxml_dir}
         raxml-ng --all --msa {input.input_fasta} --model {input.input_bic_partition} --prefix {params.prefix} --seed {SEED} --tree pars{{{params.pars_trees}}},rand{{{params.rand_trees}}} --outgroup $(cat {input.input_outgroup}) --bs-trees {params.bs_trees}
         """
+
+rule run_pem_prototype:
+    input:
+        input_tree = RAXML_DATA_DIR / "Tree.raxml.bestTree",
+        input_trait_data = PROCESSED_DATA_DIR / "Trait_data.csv"
+    params:
+        trait_column = "trophic_group",
+        k_folds = 5,
+        repeats = 5,
+        sweep_points = 21,
+        steepness = 0.6,
+        regularization_strength = 0.001,
+        l1_ratio = 0.2,
+        train_epochs = 300,
+        learning_rate = 0.05,
+        seed = SEED
+    output:
+        output_sweep = PEM_DATA_DIR / "trophic_group_sweep.csv",
+        output_predictions = PEM_DATA_DIR / "trophic_group_predictions.csv",
+        output_summary = PEM_DATA_DIR / "trophic_group_summary.txt",
+        output_plot = PEM_DATA_DIR / "trophic_group_results.png"
+    script:
+        "scripts/pem_prototype_sweep.py"
 
 
 # OLD METHOD
