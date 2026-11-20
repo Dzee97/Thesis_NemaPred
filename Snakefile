@@ -246,12 +246,12 @@ rule run_pem_prototype:
     params:
         trait_column = "trophic_group",
         k_folds = 5,
-        repeats = 5,
-        sweep_points = 21,
+        repeats = 10,
+        sweep_points = 500,
         steepness = 0.6,
         regularization_strength = 0.001,
         l1_ratio = 0.2,
-        train_epochs = 300,
+        train_epochs = 500,
         learning_rate = 0.05,
         seed = SEED
     output:
@@ -260,7 +260,7 @@ rule run_pem_prototype:
         output_summary = PEM_DATA_DIR / "trophic_group_summary.txt",
         output_plot = PEM_DATA_DIR / "trophic_group_results.png"
     script:
-        "scripts/pem_prototype_sweep.py"
+        "scripts/pem_test.py"
 
 
 # OLD METHOD
